@@ -2600,7 +2600,11 @@ public class AutomationService extends Service {
             }
             logMode("promoOverlay=true page=" + stage
                     + " action=SAFE_X（" + x[0] + "," + x[1] + "）（" + promoOverlayActions + "/3）");
-            shellTap(x[0], x[1]);
+            try {
+                shellTap(x[0], x[1]);
+            } catch (Exception tapError) {
+                logMode("promoOverlay 点击安全 X 失败: " + tapError.getMessage());
+            }
         }
         try {
             sleep(900);
