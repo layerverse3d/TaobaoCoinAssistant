@@ -7,11 +7,13 @@ android {
     compileSdk 36
 
     defaultConfig {
-        applicationId 'com.local.taobaocoinassistant'
+        // 测试版 applicationId 与原版（com.local.taobaocoinassistant）区分，以便两者并存安装；
+        // Java namespace 保持不变，源码包名仍为 com.local.taobaocoinassistant。
+        applicationId 'com.layerverse.taobaocoinassistant'
         minSdk 30
         targetSdk 36
-        versionCode 106
-        versionName '1.1'
+        versionCode 107
+        versionName '1.2-d11'
     }
 
 

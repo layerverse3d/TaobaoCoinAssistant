@@ -22,7 +22,7 @@ public final class ShizukuShell {
 
     private static final Shizuku.UserServiceArgs USER_SERVICE_ARGS =
             new Shizuku.UserServiceArgs(new ComponentName(
-                    "com.local.taobaocoinassistant",
+                    BuildConfig.APPLICATION_ID,
                     CoinUserService.class.getName()))
                     .daemon(true)
                     .processNameSuffix("coin_shell")
