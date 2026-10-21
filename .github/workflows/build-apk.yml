@@ -14,9 +14,12 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      # GitHub runner 已预装 Android SDK 与 sdkmanager；不需要再跑过时的
+      # android-actions/setup-android（其内部 sdkmanager tools 会失败）。
       - name: Install Android 16 SDK
-        run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
