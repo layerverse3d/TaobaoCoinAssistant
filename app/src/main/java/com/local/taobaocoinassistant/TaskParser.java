@@ -287,12 +287,35 @@ public final class TaskParser {
     public static boolean completed(TaskItem t) { return t.current >= t.total; }
 
     public static boolean skip(TaskItem t, TaskRuleStore.Rules rules) {
-        if (completed(t)) return true;
-        // Blacklist matching is intentionally more tolerant than ordinary routing. OCR frequently
-        // confuses visually similar Chinese characters (e.g. 淘金币趣味课堂 -> 淘全币趣昧课堂).
-        // Short generic rules still require an exact hit; only longer, specific rules get a small
-        // edit-distance allowance to avoid turning the whole classifier fuzzy.
-        return containsAnyFuzzyForBlacklist(t.name, rules.skip);
+        return skipReason(t, rules) != null;
+    }
+
+    /**
+     * 返回跳过原因（用于可诊断决策日志）；null 表示不跳过。
+     * 优先级：已完成 > 命中用户黑名单。external/跨应用名单是执行方式而非黑名单，不在此判定。
+     */
+    public static String skipReason(TaskItem t, TaskRuleStore.Rules rules) {
+        if (completed(t)) return "已完成";
+        String hit = hitBlacklistKeyword(t.name, rules.skip);
+        if (hit != null) return "命中用户黑名单:" + hit;
+        return null;
+    }
+
+    /**
+     * 黑名单命中时返回具体关键词，未命中返回 null。匹配容差与原 skip 逻辑完全一致：
+     * OCR 常把形近字识别错（如 淘金币趣味课堂 -> 淘全币趣昧课堂），短规则仅精确包含，
+     * 较长规则允许少量编辑距离，避免整站模糊。
+     */
+    public static String hitBlacklistKeyword(String name, List<String> words) {
+        String ns = TaskRuleStore.normalizeKeyword(name);
+        for (String word : words) {
+            String nw = TaskRuleStore.normalizeKeyword(word);
+            if (nw.isEmpty()) continue;
+            if (ns.contains(nw)) return word;
+            int maxDistance = nw.length() >= 6 ? 2 : (nw.length() >= 4 ? 1 : 0);
+            if (maxDistance > 0 && fuzzyContains(ns, nw, maxDistance)) return word;
+        }
+        return null;
     }
 
     public static boolean external(TaskItem t, TaskRuleStore.Rules rules) {
@@ -333,20 +356,6 @@ public final class TaskParser {
         String ns = TaskRuleStore.normalizeKeyword(s);
         for (String w : words) {
             if (!w.isEmpty() && ns.contains(TaskRuleStore.normalizeKeyword(w))) return true;
-        }
-        return false;
-    }
-
-    private static boolean containsAnyFuzzyForBlacklist(String s, List<String> words) {
-        String ns = TaskRuleStore.normalizeKeyword(s);
-        for (String word : words) {
-            String nw = TaskRuleStore.normalizeKeyword(word);
-            if (nw.isEmpty()) continue;
-            if (ns.contains(nw)) return true;
-
-            // Keep broad/short rules such as 游戏、下单、UC exact-only.
-            int maxDistance = nw.length() >= 6 ? 2 : (nw.length() >= 4 ? 1 : 0);
-            if (maxDistance > 0 && fuzzyContains(ns, nw, maxDistance)) return true;
         }
         return false;
     }

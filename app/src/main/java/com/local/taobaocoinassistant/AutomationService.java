@@ -383,15 +383,20 @@ public class AutomationService extends Service {
 
             TaskParser.TaskItem chosen = null;
             for (TaskParser.TaskItem t : ordered) {
-                logMode("候选: " + t.name);
-                if (TaskParser.skip(t, taskRules)) {
-                    logMode("跳过: " + t.name);
+                String rawName = t.name.length() > 40 ? t.name.substring(0, 40) + "…" : t.name;
+                String reason = TaskParser.skipReason(t, taskRules);
+                if (reason != null) {
+                    // 可诊断决策日志：OCR 原名（截断）+ 归一化名 + 命中的具体规则。
+                    logMode("跳过[" + reason + "] raw=" + rawName
+                            + " norm=" + TaskRuleStore.normalizeKeyword(t.name));
                     continue;
                 }
                 if (attempted.getOrDefault(t.name, 0) >= 2) {
-                    logMode("已尝试过多次，跳过: " + t.name);
+                    logMode("跳过[多次尝试未成功(" + attempted.get(t.name) + "次)]: " + rawName);
                     continue;
                 }
+                logMode("候选[通过规则，历史尝试" + attempted.getOrDefault(t.name, 0)
+                        + "次] raw=" + rawName);
                 chosen = t;
                 break;
             }
@@ -1635,7 +1640,11 @@ public class AutomationService extends Service {
         logMode("收尾复查：顶部识别到 " + topTasks.size() + " 个能量任务");
         TaskParser.TaskItem unfinished = null;
         for (TaskParser.TaskItem task : topTasks) {
-            if (TaskParser.skip(task, taskRules)) continue;
+            String skipReason = TaskParser.skipReason(task, taskRules);
+            if (skipReason != null) {
+                logMode("收尾复查跳过[" + skipReason + "]: " + task.name);
+                continue;
+            }
             if (attempted.getOrDefault(task.name, 0) >= 2) {
                 logMode("收尾复查发现未完成任务但已达到尝试上限，跳过: " + task.name);
                 continue;
@@ -1793,7 +1802,11 @@ public class AutomationService extends Service {
         logMode("收尾复查：顶部识别到 " + topTasks.size() + " 个带进度任务");
         TaskParser.TaskItem unfinished = null;
         for (TaskParser.TaskItem task : topTasks) {
-            if (TaskParser.skip(task, taskRules)) continue;
+            String skipReason = TaskParser.skipReason(task, taskRules);
+            if (skipReason != null) {
+                logMode("收尾复查跳过[" + skipReason + "]: " + task.name);
+                continue;
+            }
             if (attempted.getOrDefault(task.name, 0) >= 2) {
                 logMode("收尾复查发现未完成任务但已达到尝试上限，跳过: " + task.name);
                 continue;
