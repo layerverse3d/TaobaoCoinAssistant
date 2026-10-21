@@ -37,6 +37,8 @@ public class AutomationService extends Service {
     private static final String ACTION_STOP = "com.local.taobaocoinassistant.STOP";
     private static final String ACTION_SYNC_OVERLAY = "com.local.taobaocoinassistant.SYNC_OVERLAY";
     private static final String EXTRA_MODE = "com.local.taobaocoinassistant.EXTRA_MODE";
+    private static final String ACTION_RESTART_FROM_CURRENT = "com.local.taobaocoinassistant.RESTART_FROM_CURRENT";
+    private static final String LAST_MODE_KEY = "last_task_mode";
     private static final int FOREGROUND_ID = 2001;
     private static final String FOREGROUND_CHANNEL = "coin_automation";
 
@@ -121,12 +123,21 @@ public class AutomationService extends Service {
         else context.startService(i);
     }
 
+    /** 悬浮窗“重新开始”入口：由服务串行调度，上一轮完全结束后才原地恢复。 */
+    public static void requestRestartFromCurrent(Context context) {
+        Intent i = new Intent(context, AutomationService.class).setAction(ACTION_RESTART_FROM_CURRENT);
+        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i);
+        else context.startService(i);
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
         INSTANCE = this;
         if (ocr == null) ocr = new OcrEngine();
-        if (statusOverlay == null) statusOverlay = new StatusOverlay(this, this::stopAutomation);
+        if (statusOverlay == null) {
+            statusOverlay = new StatusOverlay(this, this::stopAutomation, this::beginRestartFromCurrent);
+        }
         Notification foreground = buildForegroundNotification();
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(FOREGROUND_ID, foreground, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
@@ -146,6 +157,8 @@ public class AutomationService extends Service {
         } else if (ACTION_START.equals(action)) {
             String modeName = intent == null ? null : intent.getStringExtra(EXTRA_MODE);
             startAutomation(TaskMode.fromName(modeName));
+        } else if (ACTION_RESTART_FROM_CURRENT.equals(action)) {
+            beginRestartFromCurrent();
         } else {
             syncOverlay();
         }
@@ -222,11 +235,36 @@ public class AutomationService extends Service {
     }
 
     private synchronized void startAutomation(TaskMode mode) {
+        beginRun(mode, false);
+    }
+
+    /** 悬浮窗“重新开始”：沿用上一次显式选择的模式，从当前页面原地恢复（不重启淘宝）。 */
+    private synchronized void beginRestartFromCurrent() {
+        beginRun(loadLastMode(), true);
+    }
+
+    private void saveLastMode(TaskMode mode) {
+        getSharedPreferences("ui_settings_v1", Context.MODE_PRIVATE)
+                .edit().putString(LAST_MODE_KEY, mode.name()).apply();
+    }
+
+    private TaskMode loadLastMode() {
+        String name = getSharedPreferences("ui_settings_v1", Context.MODE_PRIVATE)
+                .getString(LAST_MODE_KEY, null);
+        return TaskMode.fromName(name);
+    }
+
+    /**
+     * 唯一的运行入口：同一时刻只允许一个自动化作业（单线程 worker + automationJobActive）。
+     * resumeFromCurrent=true 时走原地恢复，不 force-stop 淘宝。
+     */
+    private synchronized void beginRun(TaskMode mode, boolean resumeFromCurrent) {
         if (automationJobActive || AppState.running) {
-            logMode("上一轮任务仍在收尾，请稍后再开始");
+            logMode("上一轮任务仍在运行/收尾，暂不能开始");
             return;
         }
         currentMode = (mode == null ? TaskMode.COIN : mode);
+        saveLastMode(currentMode);
         energyPanelConfirmed = false;
         promoOverlayActions = 0;
         automationJobActive = true;
@@ -238,40 +276,52 @@ public class AutomationService extends Service {
         finalTopRecheckRounds = 0;
         popupDismissCount = 0;
         taskRules = TaskRuleStore.load(this);
-        logMode("━━━━━━━━━━ 新一轮执行 ━━━━━━━━━━");
+        logMode("━━━━━━━━━━ " + (resumeFromCurrent ? "原地重新开始" : "新一轮执行") + " ━━━━━━━━━━");
         logMode("任务规则已加载：" + taskRules.summary());
         AppState.running = true;
         AppState.status = "正在启动";
         refreshForegroundNotification();
-        worker.execute(this::runAutomation);
+        worker.execute(() -> runAutomationInternal(resumeFromCurrent));
     }
 
     private void stopAutomation() {
         stopRequested = true;
-        AppState.running = false;
-        AppState.status = "已停止";
-        logMode("收到停止请求");
+        // 保持 running=true 直到 worker 真正退出（finally），期间悬浮窗仍显示“停止”，
+        // 状态显示“正在收尾”，避免用户误以为已停止而重复操作。
+        AppState.status = "正在收尾";
+        logMode("收到停止请求，正在收尾…");
         refreshForegroundNotification();
     }
 
-    private void runAutomation() {
-        NotificationHelper.notify(this, "淘金币助手", currentMode.label + "任务开始执行", 1001);
-        logMode("开始执行：单线程状态机，不启用后台自动点击");
+    private void runAutomationInternal(boolean resumeFromCurrent) {
+        NotificationHelper.notify(this, "淘金币助手",
+                currentMode.label + (resumeFromCurrent ? "原地重新开始" : "任务开始执行"), 1001);
+        logMode(resumeFromCurrent
+                ? "原地重新开始：从当前页面恢复，不重启淘宝"
+                : "开始执行：单线程状态机，不启用后台自动点击");
         try {
             if (!ShizukuShell.hasPermission()) {
                 throw new IllegalStateException("Shizuku 未连接或未授权");
             }
-            if (!enterTaskList(true, currentMode)) {
+            boolean entered = resumeFromCurrent
+                    ? resumeFromCurrentPage(currentMode)
+                    : enterTaskList(true, currentMode);
+            if (!entered) {
                 if (stopRequested) {
                     AppState.status = "已停止";
                     logMode("用户已停止执行，正常退出");
                     return;
                 }
-                throw new IllegalStateException("无法进入" + currentMode.label + "任务列表");
+                throw new IllegalStateException(resumeFromCurrent
+                        ? "原地恢复失败：无法确认当前页面属于" + currentMode.label + "任务流程"
+                        : "无法进入" + currentMode.label + "任务列表");
             }
             AppState.status = "识别任务中";
             mainLoop();
-            if (!stopRequested) {
+            if (stopRequested) {
+                AppState.status = "已停止";
+                logMode("用户已停止执行，正常退出");
+            } else {
                 AppState.status = "已完成";
                 logMode("本次结束，共发起执行 " + executedCount + " 次任务");
                 NotificationHelper.notify(this, "淘金币助手", currentMode.label + "任务执行结束，共发起 " + executedCount + " 次", 1002);
@@ -291,6 +341,59 @@ public class AutomationService extends Service {
             refreshForegroundNotification();
             if (!OverlaySettings.isEnabled(this)) mainHandler.post(this::stopSelf);
         }
+    }
+
+    /** 仅用于原地恢复：面板滚动后标题滚出视口时，凭多条任务行 + 多个动作按钮认定能量列表。 */
+    private boolean isResumableEnergyList(OcrEngine.Snapshot snap) {
+        if (currentMode != TaskMode.DOUBLE11_ENERGY || snap == null) return false;
+        List<TaskParser.TaskItem> tasks = TaskParser.parseEnergyActionable(snap.rows, snap.height);
+        return !tasks.isEmpty() && TaskParser.countActionRows(snap.rows) >= 2;
+    }
+
+    /**
+     * 原地恢复（悬浮窗“重新开始”）：绝不 force-stop 淘宝、不走完整首页重建。
+     * 顺序：任务面板 → 阻塞弹窗处理 → 赛车首页开面板 → 子页面有限 Back；
+     * 证据不足时明确失败并提示用户手动返回，不瞎点。
+     */
+    private boolean resumeFromCurrentPage(TaskMode mode) throws Exception {
+        ForegroundState fg = currentForeground();
+        if (!fg.valid() || !fg.isPackage(TB)) {
+            logMode("原地恢复：当前不在淘宝前台（" + fg + "），请手动返回活动页后再试");
+            return false;
+        }
+
+        for (int round = 0; round < 5 && !stopRequested; round++) {
+            OcrEngine.Snapshot snap = ocr.captureTaskList();
+
+            if (isTaskContextForMode(snap) || isResumableEnergyList(snap)) {
+                if (mode == TaskMode.DOUBLE11_ENERGY) energyPanelConfirmed = true;
+                logMode("原地恢复：已确认" + mode.label + "任务面板，直接进入主循环");
+                return true;
+            }
+
+            if (dismissBlockingPopupIfPresent(snap, "原地恢复")) {
+                sleep(900);
+                continue;
+            }
+
+            if (looksLikeCoinHomeSnapshot(snap)) {
+                logMode("原地恢复：当前在淘金币赛车首页，打开" + mode.label + "任务面板");
+                boolean ok = openPanelForMode(mode) && isModeTaskListVisible(mode);
+                if (ok && mode == TaskMode.DOUBLE11_ENERGY) energyPanelConfirmed = true;
+                return ok;
+            }
+
+            logMode("原地恢复：当前页面暂未识别（第 " + (round + 1) + "/5 轮），尝试有限返回");
+            shellBack();
+            sleep(1000);
+            ForegroundState now = currentForeground();
+            if (!now.isPackage(TB)) {
+                logMode("原地恢复：返回后已离开淘宝，请手动返回活动页后再试");
+                return false;
+            }
+        }
+        logMode("原地恢复未能回到" + mode.label + "任务面板；请手动返回活动页，或从 App 主界面完整启动");
+        return false;
     }
 
     private void mainLoop() throws Exception {
