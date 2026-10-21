@@ -69,12 +69,17 @@ public class AutomationService extends Service {
     // 能量模式：已成功认证“做任务赚能量”任务面板。用于面板滚动后顶部标题/累计奖励
     // 离开 OCR 视口时，仍能结合「进度 + 动作按钮」同行证据确认仍处于任务列表上下文。
     private volatile boolean energyPanelConfirmed = false;
+    // 本轮已对“看…得能量”促销覆盖层执行的动作次数（BACK/安全X），上限 3 次，防止连续乱按。
+    private int promoOverlayActions = 0;
 
     // 当新版 UC WebView 不暴露 EditText 时，Android shell 的 `input text` 对中文并不可靠。
     // 因此 OCR+Shizuku 兜底使用纯 ASCII 搜索词；只用于完成“搜一搜”任务，不改变任务筛选规则。
     private static final List<String> SEARCH_KEYS_ASCII = Arrays.asList(
             "iphone", "macbook", "xiaomi", "camera", "milk"
     );
+
+    // “看…得能量”促销覆盖层标题锚（看抵扣快闪得能量 / 看宠物好货得能量 等变体）。
+    private static final Pattern PROMO_OVERLAY_TITLE = Pattern.compile("看.{1,10}得能量");
 
     public static boolean isServiceActive() {
         AutomationService s = INSTANCE;
@@ -223,6 +228,7 @@ public class AutomationService extends Service {
         }
         currentMode = (mode == null ? TaskMode.COIN : mode);
         energyPanelConfirmed = false;
+        promoOverlayActions = 0;
         automationJobActive = true;
         stopRequested = false;
         attempted.clear();
@@ -2082,6 +2088,15 @@ public class AutomationService extends Service {
         if (snap == null || stopRequested) return false;
         if (!TB.equals(currentPackage())) return false;
 
+        // §3 P0：高置信促销覆盖层（“看…得能量”）必须先于 KEEP_PANEL 面板保护判定。
+        // 该弹窗会遮住能量面板/赛车首页，但背景的任务行、标题仍能被 OCR 看到，
+        // 若先走面板保护会把真正的阻塞弹窗放行。判定要求两个相互独立且空间位置
+        // 合理的证据（标题“看…得能量” + “去浏览加抵好物”或“浏览商品…得”），
+        // 单独的 能量/立即领取/奖励 字样绝不触发。默认不点击“去浏览加抵好物”。
+        if (detectPromoOverlay(snap)) {
+            return handlePromoOverlay(snap, stage);
+        }
+
         // P0：合法能量任务面板优先于普通弹窗关闭。
         // 能量模式下，若当前截图有可信能量任务面板证据（明确标题锚点 + 奖励/任务动作
         // 组合，或已认证后的列表上下文），绝不可执行 Back 关闭；否则会把已成功打开的
@@ -2158,6 +2173,97 @@ public class AutomationService extends Service {
                 + " score=" + score + " action=BACK（" + popupDismissCount + "/6）");
         ShizukuShell.exec("input keyevent KEYCODE_BACK");
         return true;
+    }
+
+    /**
+     * “看…得能量”促销覆盖层检测。要求两个相互独立且空间位置合理的证据：
+     * 1) 屏幕上半部出现“看…得能量”标题（如 看抵扣快闪得能量 / 看宠物好货得能量）；
+     * 2) 中下部出现“去浏览加抵好物”CTA 或“浏览商品…得”文案。
+     * 单独的 能量/立即领取/奖励/去完成 字样绝不触发，避免误伤合法能量任务面板。
+     */
+    private boolean detectPromoOverlay(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        boolean titleHit = false;
+        boolean ctaHit = false;
+        boolean browseNoteHit = false;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (t.isEmpty()) continue;
+            int cy = row.bounds.centerY();
+            if (!titleHit && cy < snap.height * 0.50f
+                    && t.length() <= 18
+                    && PROMO_OVERLAY_TITLE.matcher(t).find()) {
+                titleHit = true;
+            }
+            if (!ctaHit && cy > snap.height * 0.42f
+                    && (t.contains("去浏览加抵好物") || fuzzyContains(t, "去浏览加抵好物", 1))) {
+                ctaHit = true;
+            }
+            if (!browseNoteHit && cy > snap.height * 0.20f && cy < snap.height * 0.65f
+                    && t.contains("浏览商品") && t.contains("得")) {
+                browseNoteHit = true;
+            }
+            if (titleHit && (ctaHit || browseNoteHit)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 促销覆盖层处理：BACK 优先（最多 2 次），仍无效且存在安全 X 证据时点击一次 X，
+     * 每次动作后截图复查；全程不点击“去浏览加抵好物”购物 CTA。总上限 3 次，
+     * 超限后交由页面恢复流程/人工处理。
+     */
+    private boolean handlePromoOverlay(OcrEngine.Snapshot snap, String stage) throws Exception {
+        if (promoOverlayActions >= 3) {
+            logMode("promoOverlay=true page=" + stage
+                    + " action=GIVE_UP（已达 3 次处理上限，不点购物 CTA，交由页面恢复/人工处理）");
+            return false;
+        }
+        promoOverlayActions++;
+        if (promoOverlayActions <= 2) {
+            logMode("promoOverlay=true page=" + stage
+                    + " evidence=[看…得能量标题 + 去浏览加抵好物/浏览商品15s得] action=BACK（"
+                    + promoOverlayActions + "/3）");
+            ShizukuShell.exec("input keyevent KEYCODE_BACK");
+        } else {
+            int[] x = findPromoCloseX(snap);
+            if (x == null) {
+                promoOverlayActions--;
+                logMode("promoOverlay=true page=" + stage
+                        + " action=SKIP（Back 未生效且未定位到安全的关闭 X；不点击购物 CTA）");
+                return false;
+            }
+            logMode("promoOverlay=true page=" + stage
+                    + " action=SAFE_X（" + x[0] + "," + x[1] + "）（" + promoOverlayActions + "/3）");
+            shellTap(x[0], x[1]);
+        }
+        sleep(900);
+        boolean recovered = false;
+        try {
+            OcrEngine.Snapshot check = ocr.captureNavigation();
+            recovered = !detectPromoOverlay(check);
+        } catch (Throwable ignored) {}
+        logMode("promoOverlay 复查: " + (recovered ? "覆盖层已消失" : "覆盖层仍在或未确认，等待下一轮处理"));
+        return true;
+    }
+
+    /**
+     * 在促销覆盖层上定位“关闭 X”：仅接受 OCR 元素级、单字符 X/×/✕、
+     * 尺寸小且位于弹窗边缘区域的目标；找不到返回 null，不做坐标猜测。
+     */
+    private int[] findPromoCloseX(OcrEngine.Snapshot snap) {
+        if (snap == null || snap.elements == null) return null;
+        for (OcrEngine.OcrRow e : snap.elements) {
+            String t = normalizeOcr(e.text);
+            if (!(t.equals("X") || t.equals("×") || t.equals("x") || t.equals("✕"))) continue;
+            if (e.bounds.width() > snap.width * 0.08f) continue;
+            int cy = e.bounds.centerY();
+            if (cy < snap.height * 0.25f || cy > snap.height * 0.95f) continue;
+            int cx = e.bounds.centerX();
+            if (cx < snap.width * 0.10f || cx > snap.width * 0.90f) continue;
+            return new int[]{cx, cy};
+        }
+        return null;
     }
 
     /**
