@@ -66,6 +66,9 @@ public class AutomationService extends Service {
     private boolean coinHomeGeometryFallbackUsed = false;
     // v1.1: generic modal/ad obstruction recovery. Back is safer than tapping an unknown X.
     private int popupDismissCount = 0;
+    // 能量模式：已成功认证“做任务赚能量”任务面板。用于面板滚动后顶部标题/累计奖励
+    // 离开 OCR 视口时，仍能结合「进度 + 动作按钮」同行证据确认仍处于任务列表上下文。
+    private volatile boolean energyPanelConfirmed = false;
 
     // 当新版 UC WebView 不暴露 EditText 时，Android shell 的 `input text` 对中文并不可靠。
     // 因此 OCR+Shizuku 兜底使用纯 ASCII 搜索词；只用于完成“搜一搜”任务，不改变任务筛选规则。
@@ -219,6 +222,7 @@ public class AutomationService extends Service {
             return;
         }
         currentMode = (mode == null ? TaskMode.COIN : mode);
+        energyPanelConfirmed = false;
         automationJobActive = true;
         stopRequested = false;
         attempted.clear();
@@ -252,6 +256,11 @@ public class AutomationService extends Service {
                 throw new IllegalStateException("Shizuku 未连接或未授权");
             }
             if (!enterTaskList(true, currentMode)) {
+                if (stopRequested) {
+                    AppState.status = "已停止";
+                    logMode("用户已停止执行，正常退出");
+                    return;
+                }
                 throw new IllegalStateException("无法进入" + currentMode.label + "任务列表");
             }
             AppState.status = "识别任务中";
@@ -262,9 +271,14 @@ public class AutomationService extends Service {
                 NotificationHelper.notify(this, "淘金币助手", currentMode.label + "任务执行结束，共发起 " + executedCount + " 次", 1002);
             }
         } catch (Throwable e) {
-            AppState.status = "异常结束";
-            logMode("异常: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            NotificationHelper.notify(this, "淘金币助手", currentMode.label + "任务异常结束，请查看日志", 1003);
+            if (stopRequested) {
+                AppState.status = "已停止";
+                logMode("用户已停止执行，正常退出");
+            } else {
+                AppState.status = "异常结束";
+                logMode("异常: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                NotificationHelper.notify(this, "淘金币助手", currentMode.label + "任务异常结束，请查看日志", 1003);
+            }
         } finally {
             AppState.running = false;
             automationJobActive = false;
@@ -491,10 +505,14 @@ public class AutomationService extends Service {
         return TaskParser.parse(snap.rows, snap.height);
     }
 
-    /** 按当前模式认证“当前画面确实是本模式的任务面板”。 */
+    /**
+     * 按当前模式认证“当前画面确实是本模式的任务面板”。
+     * 能量模式额外支持“有状态的已进入任务列表”上下文（标题滚出视口后仍可认证）。
+     */
     private boolean isTaskContextForMode(OcrEngine.Snapshot snap) {
         if (currentMode == TaskMode.DOUBLE11_ENERGY) {
-            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height);
+            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
         }
         return TaskParser.isTrustedTaskContext(snap.rows, snap.height);
     }
@@ -502,7 +520,8 @@ public class AutomationService extends Service {
     /** 按当前模式判断“已进入可执行任务面板（即使当前视口暂无带进度任务）”。 */
     private boolean isExpandedPanelForMode(OcrEngine.Snapshot snap) {
         if (currentMode == TaskMode.DOUBLE11_ENERGY) {
-            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height);
+            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
         }
         return TaskParser.isExpandedTaskPanelView(snap.rows, snap.height);
     }
@@ -513,6 +532,22 @@ public class AutomationService extends Service {
             return TaskParser.energyBottomVisible(snap.rows);
         }
         return TaskParser.bottomVisible(snap.rows);
+    }
+
+    /**
+     * 能量模式“已进入可信任务列表”的有状态上下文判断。
+     *
+     * <p>面板已确认打开并滚动后，顶部“做任务赚能量”标题/“累计任务奖励”可能离开 OCR
+     * 视口；不能单靠标题不见了就判定失败。此方法仅在本次运行已成功认证过能量面板
+     * （energyPanelConfirmed）的前提下，结合当前可见的多条「进度 + 任务动作按钮」同行
+     * 证据与前台包名判断仍处于列表。绝不因任意 0/1 或单个“能量”字样通过。</p>
+     */
+    private boolean isEnergyTaskListContext(OcrEngine.Snapshot snap) {
+        if (snap == null || !energyPanelConfirmed) return false;
+        if (!TB.equals(currentPackage())) return false;
+        List<TaskParser.TaskItem> tasks = TaskParser.parseEnergyActionable(snap.rows, snap.height);
+        int actionRows = TaskParser.countActionRows(snap.rows);
+        return !tasks.isEmpty() && actionRows >= 2;
     }
 
     private void executeTask(TaskParser.TaskItem task, int width, int height) throws Exception {
@@ -735,6 +770,7 @@ public class AutomationService extends Service {
         // 进入“领淘金币”后不要求 UC WebView 暴露任何 UI 节点，只按真实截图继续
         // 下一阶段，避免明明已到淘金币首页却被误判为失败。
         if (cleanStart) {
+            energyPanelConfirmed = false;
             ShizukuShell.exec("am force-stop " + TB);
         }
         launchTaobao();
@@ -1418,7 +1454,8 @@ public class AutomationService extends Service {
     /** 按模式判断当前截图是否为本模式的任务面板（用于首页导航短路）。 */
     private boolean taskPanelVisibleForMode(OcrEngine.Snapshot snap) {
         if (currentMode == TaskMode.DOUBLE11_ENERGY) {
-            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height);
+            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
         }
         return taskPanelVisibleInSnapshot(snap);
     }
@@ -1445,14 +1482,15 @@ public class AutomationService extends Service {
                 continue;
             }
 
-            if (dismissBlockingPopupIfPresent(snap, "淘金币首页")) {
-                sleep(850);
-                continue;
-            }
-
+            // P0：先认证合法能量面板，再考虑遮挡关闭，避免把已打开的面板误关。
             if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)) {
                 logMode("OCR 已确认能量面板已打开");
                 return ensureEnergyPanelReady();
+            }
+
+            if (dismissBlockingPopupIfPresent(snap, "淘金币首页")) {
+                sleep(850);
+                continue;
             }
 
             int[] p = findEnergyEntryPoint(snap);
@@ -1486,16 +1524,20 @@ public class AutomationService extends Service {
                 continue;
             }
 
+            // P0：先认证合法能量面板，再考虑遮挡关闭，避免面板刚打开就被误关。
+            if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)) {
+                energyPanelConfirmed = true;
+                logMode("已确认“做任务赚能量”任务面板，可进入主循环");
+                return true;
+            }
+
             if (dismissBlockingPopupIfPresent(snap, "能量任务面板")) {
                 sleep(800);
                 continue;
             }
 
-            if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)) {
-                logMode("已确认“做任务赚能量”任务面板，可进入主循环");
-                return true;
-            }
             logMode("第 " + attempt + "/3 次未确认能量面板特征，等待刷新");
+            if (attempt >= 2) logMode("能量面板 OCR 摘要: " + summarizeOcrSnippet(snap));
             sleep(420);
         }
         return false;
@@ -1520,7 +1562,8 @@ public class AutomationService extends Service {
         if (!fg.isPackage(TB)) return false;
         try {
             OcrEngine.Snapshot snap = ocr.captureTaskPanel();
-            if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)) {
+            if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap)) {
                 List<TaskParser.TaskItem> tasks = TaskParser.parseEnergyActionable(snap.rows, snap.height);
                 logMode("能量任务面板认证通过：可见带进度任务 " + tasks.size() + " 个");
                 return true;
@@ -2026,7 +2069,22 @@ public class AutomationService extends Service {
         if (snap == null || stopRequested) return false;
         if (!TB.equals(currentPackage())) return false;
 
+        // P0：合法能量任务面板优先于普通弹窗关闭。
+        // 能量模式下，若当前截图有可信能量任务面板证据（明确标题锚点 + 奖励/任务动作
+        // 组合，或已认证后的列表上下文），绝不可执行 Back 关闭；否则会把已成功打开的
+        // “做任务赚能量”面板误当成广告弹窗关掉，陷入“打开→关闭→重试”死循环。
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            boolean trusted = TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
+            if (trusted) {
+                logMode("弹窗判定 page=" + stage + " mode=能量 trusted=true action=KEEP_PANEL"
+                        + "（合法能量任务面板，不执行 Back）");
+                return false;
+            }
+        }
+
         String all = normalizeOcr(snap.allText());
+        List<String> hits = new ArrayList<>();
         int score = 0;
 
         // 高特异文案：这些内容通常只会出现在覆盖式促销/引导弹窗中。
@@ -2036,12 +2094,12 @@ public class AutomationService extends Service {
                 "出行玩乐", "订票订酒店", "闪购福利"
         };
         for (String k : strong) {
-            if (all.contains(normalizeOcr(k))) score += 2;
+            if (all.contains(normalizeOcr(k))) { score += 2; hits.add("强:" + k); }
         }
         // 这些词在普通淘宝页面也可能出现，只作为弱证据，不能单独触发 Back。
         String[] weak = new String[]{"淘宝闪购", "加抵金", "抵金", "额外抵", "去看看"};
         for (String k : weak) {
-            if (all.contains(normalizeOcr(k))) score += 1;
+            if (all.contains(normalizeOcr(k))) { score += 1; hits.add("弱:" + k); }
         }
 
         // 背景仍像淘金币/任务页时，中间出现大 CTA 更像是“盖在原页面上的弹窗”。
@@ -2065,19 +2123,47 @@ public class AutomationService extends Service {
                 break;
             }
         }
-        if (backgroundContext && centeredCta) score += 2;
+        if (backgroundContext && centeredCta) { score += 2; hits.add("背景+居中CTA"); }
 
-        if (score < 3) return false;
+        String hitDesc = hits.isEmpty() ? "无" : String.join(",", hits);
+        if (score < 3) {
+            logMode("弹窗判定 page=" + stage + " mode=" + currentMode.label
+                    + " trusted=false hits=[" + hitDesc + "] centeredCta=" + centeredCta
+                    + " score=" + score + " action=KEEP");
+            return false;
+        }
         if (popupDismissCount >= 6) {
-            logMode("疑似遮挡弹窗仍反复出现，但已达到本轮自动关闭上限；交给页面恢复流程处理");
+            logMode("弹窗判定 page=" + stage + " mode=" + currentMode.label
+                    + " hits=[" + hitDesc + "] score=" + score
+                    + " 已达自动关闭上限，交给页面恢复流程");
             return false;
         }
 
         popupDismissCount++;
-        logMode("检测到疑似遮挡弹窗（" + stage + "，证据分=" + score + "），优先使用系统返回关闭 ("
-                + popupDismissCount + "/6)");
+        logMode("弹窗判定 page=" + stage + " mode=" + currentMode.label
+                + " trusted=false hits=[" + hitDesc + "] centeredCta=" + centeredCta
+                + " score=" + score + " action=BACK（" + popupDismissCount + "/6）");
         ShizukuShell.exec("input keyevent KEYCODE_BACK");
         return true;
+    }
+
+    /**
+     * 安全裁剪的 OCR 摘要：只输出前若干行文字并限制长度，用于两次认证失败后的诊断，
+     * 不包含完整截图、账号、地址、订单或 token 等敏感信息。
+     */
+    private String summarizeOcrSnippet(OcrEngine.Snapshot snap) {
+        if (snap == null) return "<无截图>";
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (t.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(" | ");
+            sb.append(t);
+            count++;
+            if (count >= 14 || sb.length() > 240) break;
+        }
+        return sb.length() == 0 ? "<无文字>" : sb.toString();
     }
 
     private String normalizeOcr(String text) {
