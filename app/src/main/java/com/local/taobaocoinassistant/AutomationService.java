@@ -594,11 +594,17 @@ public class AutomationService extends Service {
     }
 
     private void browseCurrentTask(int width, int height, boolean external) throws Exception {
-        final long durationMs = 22_000L;
+        // 金币/能量普通浏览保持原有约 22 秒（覆盖 5s/15s 任务），不做回归性改动。
+        browseFor(width, height, 22_000L, external);
+    }
+
+    /** 通用浏览滑动；时长可调（普通浏览 22 秒，搜索发现中间页流程约 8 秒）。 */
+    private void browseFor(int width, int height, long durationMs, boolean external) throws Exception {
         final long startedAt = SystemClock.elapsedRealtime();
         long lastDialogCheckAt = 0L;
 
-        logMode(external ? "跨应用任务：等待约 22 秒，不在外部 App 内主动滑动" : "普通浏览任务：按最终脚本逻辑浏览约 22 秒");
+        logMode(external ? "跨应用任务：等待约 " + (durationMs / 1000) + " 秒，不在外部 App 内主动滑动"
+                : "浏览任务：按脚本逻辑浏览约 " + (durationMs / 1000) + " 秒");
 
         while (!stopRequested && SystemClock.elapsedRealtime() - startedAt < durationMs) {
             // 纯 OCR 模式：每隔约 3 秒检查一次“浏览器打开”系统弹窗。
@@ -640,12 +646,137 @@ public class AutomationService extends Service {
         return lo + random.nextInt(hi - lo + 1);
     }
 
+    /** 是否为“历史搜索/搜索发现”搜索中间页（双11搜索任务的必经中间页）。 */
+    private boolean isSearchDiscoveryPage(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        String all = normalizeOcr(snap.allText());
+        return all.contains("搜索发现") || all.contains("历史搜索");
+    }
+
+    private boolean isUnsafeSearchDiscoveryText(String t) {
+        String[] unsafe = {"删除", "清空", "反馈", "客服", "购物车", "结算", "支付",
+                "收藏", "加购", "下单", "搜索发现", "历史搜索"};
+        for (String w : unsafe) {
+            if (t.contains(w)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 在搜索发现区定位一个安全的推荐项。优先元素级目标——两列卡片会被行级 OCR
+     * 合并成一行，点 union 中心会落在两卡之间的空隙。排除 清空/删除/反馈/支付 等
+     * 危险词与“搜索发现/历史搜索”标题锚本身；绝不点垃圾桶/清空历史。
+     */
+    private int[] findSearchDiscoveryTarget(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        int anchorBottom = -1;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            if (normalizeOcr(row.text).contains("搜索发现")) {
+                anchorBottom = row.bounds.bottom;
+                break;
+            }
+        }
+        if (anchorBottom < 0) {
+            for (OcrEngine.OcrRow row : snap.rows) {
+                if (normalizeOcr(row.text).contains("历史搜索")) {
+                    anchorBottom = row.bounds.bottom;
+                    break;
+                }
+            }
+        }
+        if (anchorBottom < 0) return null;
+        int minY = anchorBottom + 8;
+        int maxY = (int) (snap.height * 0.92f);
+
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                int cy = e.bounds.centerY();
+                if (cy < minY || cy > maxY) continue;
+                String t = normalizeOcr(e.text);
+                if (t.length() < 2 || t.length() > 20) continue;
+                if (isUnsafeSearchDiscoveryText(t)) continue;
+                return new int[]{e.bounds.centerX(), cy};
+            }
+        }
+        for (OcrEngine.OcrRow row : snap.rows) {
+            int cy = row.bounds.centerY();
+            if (cy < minY || cy > maxY) continue;
+            String t = normalizeOcr(row.text);
+            if (t.length() < 2 || t.length() > 20) continue;
+            if (isUnsafeSearchDiscoveryText(t)) continue;
+            return new int[]{Math.max(24, Math.min(snap.width - 24, row.bounds.centerX())), cy};
+        }
+        return null;
+    }
+
+    /**
+     * 能量搜索任务专用：识别“历史搜索/搜索发现”中间页，点击安全推荐项并验证页面
+     * 切换，随后浏览约 8 秒（5 秒任务 + 缓冲）。返回 Boolean.TRUE/FALSE 表示已按
+     * 该页面处理（成功/失败）；null 表示页面类型不匹配或无法安全定位，调用方回退
+     * 到原有输入关键词流程。返回任务面板/进度复查由 executeTask 的
+     * returnToTaskList 与主循环完成。
+     */
+    private Boolean tryHandleSearchDiscoveryPage() throws Exception {
+        for (int i = 1; i <= 3 && !stopRequested; i++) {
+            OcrEngine.Snapshot snap;
+            try {
+                snap = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("搜索中间页 OCR 失败: " + e.getMessage());
+                sleep(700);
+                continue;
+            }
+            if (!isSearchDiscoveryPage(snap)) {
+                if (i >= 2) return null;   // 连续两帧都不是中间页，交给原流程
+                sleep(800);
+                continue;
+            }
+
+            logMode("识别到“历史搜索/搜索发现”中间页（不触碰清空/删除历史）");
+            int[] target = findSearchDiscoveryTarget(snap);
+            if (target == null) {
+                logMode("搜索发现页未能安全定位推荐项；回退到输入关键词流程");
+                return null;
+            }
+            String before = compactPanelSignature(snap);
+            shellTap(target[0], target[1]);
+            logMode("已点击搜索发现推荐项 (" + target[0] + ", " + target[1] + ")");
+            sleep(2600);
+            if (stopRequested) return false;
+
+            OcrEngine.Snapshot after = null;
+            try {
+                after = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("点击推荐项后 OCR 暂时失败，按已进入浏览页处理: " + e.getMessage());
+            }
+            boolean left = after == null
+                    || (!isSearchDiscoveryPage(after) && !compactPanelSignature(after).equals(before));
+            if (!left) {
+                logMode("点击推荐项后页面未切换，本次按失败记录，返回任务列表复查进度");
+                return false;
+            }
+            logMode("已进入推荐/结果页，开始约 8 秒安全浏览（少量滑动）");
+            browseFor(after == null ? snap.width : after.width,
+                    after == null ? snap.height : after.height, 8_000L, false);
+            return !stopRequested;
+        }
+        return null;
+    }
+
     /**
      * 搜一搜任务：纯 OCR 定位搜索栏，Shizuku 负责聚焦、输入和提交。
      * 不读取 EditText 或 WebView UI tree；搜索页只以截图 OCR 与 Shizuku 输入为准。
      */
     private boolean handleSearchTask() throws Exception {
         AppState.status = "搜索任务：OCR定位搜索框";
+
+        // 能量模式：优先处理“历史搜索/搜索发现”中间页（点推荐项 → 浏览 → 逐步返回）。
+        // 返回 null 表示当前不是该中间页或无法安全定位推荐项，回退到原有输入关键词流程。
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            Boolean discovery = tryHandleSearchDiscoveryPage();
+            if (discovery != null) return discovery;
+        }
 
         for (int attempt = 1; attempt <= 8 && !stopRequested; attempt++) {
             try {
