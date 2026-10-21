@@ -14,12 +14,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # GitHub runner 已预装 Android SDK 与 sdkmanager；不需要再跑过时的
-      # android-actions/setup-android（其内部 sdkmanager tools 会失败）。
+      # GitHub runner 已预装 Android SDK 但 sdkmanager 不在 PATH；显式定位后再安装组件。
       - name: Install Android 16 SDK
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1)
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          yes | "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
