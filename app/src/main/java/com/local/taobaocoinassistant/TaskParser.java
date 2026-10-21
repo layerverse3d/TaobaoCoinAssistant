@@ -172,6 +172,71 @@ public final class TaskParser {
         return isTrustedTaskList(rows, screenHeight) || isExpandedTaskPanelView(rows, screenHeight);
     }
 
+    /**
+     * 能量任务面板认证（双十一赚能量）。
+     *
+     * <p>强锚点是弹窗标题“做任务赚能量”；顶部“累计任务奖励 / 当前进度”是奖励进度条，
+     * 不是普通任务。认证必须同时具备标题锚点 + 动作按钮证据（或奖励头部 + 动作按钮），
+     * 避免仅凭“能量”两字误点广告/商品。</p>
+     */
+    public static boolean isTrustedEnergyTaskPanel(List<OcrEngine.OcrRow> rows, int screenHeight) {
+        if (rows == null || rows.isEmpty()) return false;
+        String all = allNormalized(rows);
+        boolean titleAnchor = all.contains(normalize("做任务赚能量"));
+        boolean rewardHeader = all.contains(normalize("累计任务奖励")) || all.contains(normalize("当前进度"));
+        int actionRows = countActionRows(rows);
+        List<TaskItem> actionable = parseEnergyActionable(rows, screenHeight);
+
+        if (titleAnchor && rewardHeader && actionRows >= 1) return true;
+        if (titleAnchor && !actionable.isEmpty()) return true;
+        if (rewardHeader && actionRows >= 2 && !actionable.isEmpty()) return true;
+        return false;
+    }
+
+    /**
+     * 能量模式严格解析：只返回“旁边确实存在任务动作按钮”的带进度任务行，
+     * 并额外排除顶部“当前进度 0/50”“累计任务奖励”这类奖励进度（不是任务）。
+     */
+    public static List<TaskItem> parseEnergyActionable(List<OcrEngine.OcrRow> rows, int screenHeight) {
+        List<TaskItem> out = new ArrayList<>();
+        for (TaskItem t : parseActionable(rows, screenHeight)) {
+            String n = normalize(t.name);
+            if (n.startsWith("当前进度") || n.contains("累计任务奖励") || n.contains("次任务")) continue;
+            out.add(t);
+        }
+        return out;
+    }
+
+    /** 能量任务列表底部标记；识别不到时退回“连续无变化即到底”的通用机制。 */
+    public static boolean energyBottomVisible(List<OcrEngine.OcrRow> rows) {
+        String all = allNormalized(rows);
+        return all.contains(normalize("没有更多"))
+                || all.contains(normalize("已经到底"))
+                || all.contains(normalize("到底啦"))
+                || all.contains(normalize("暂无更多"));
+    }
+
+    /**
+     * 解析“当前进度 X/Y”，返回 {current, total}；找不到返回 null。
+     * 用于能量累计任务奖励 5/20/50 门槛判断，不参与任务点击。
+     */
+    public static int[] energyCumulativeProgress(List<OcrEngine.OcrRow> rows) {
+        if (rows == null) return null;
+        for (OcrEngine.OcrRow row : rows) {
+            String n = normalize(row.text);
+            if (!n.contains("当前进度")) continue;
+            Matcher m = PROGRESS.matcher(n);
+            if (m.find()) {
+                try {
+                    int current = parseProgressNumber(m.group(2));
+                    int total = parseProgressNumber(m.group(3));
+                    if (total > 0 && current >= 0 && current <= total) return new int[]{current, total};
+                } catch (Exception ignored) {}
+            }
+        }
+        return null;
+    }
+
     public static int countActionRows(List<OcrEngine.OcrRow> rows) {
         int count = 0;
         for (OcrEngine.OcrRow row : rows) {
