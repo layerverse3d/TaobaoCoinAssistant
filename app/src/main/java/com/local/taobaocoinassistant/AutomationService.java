@@ -500,11 +500,12 @@ public class AutomationService extends Service {
                             + " norm=" + TaskRuleStore.normalizeKeyword(t.name));
                     continue;
                 }
-                if (attempted.getOrDefault(t.name, 0) >= 2) {
-                    logMode("跳过[多次尝试未成功(" + attempted.get(t.name) + "次)]: " + rawName);
+                if (attempted.getOrDefault(stableTaskId(t), 0) >= 2) {
+                    logMode("跳过[多次尝试未成功(" + attempted.get(stableTaskId(t)) + "次)]: " + rawName
+                            + " norm=" + TaskRuleStore.normalizeKeyword(t.name));
                     continue;
                 }
-                logMode("候选[通过规则，历史尝试" + attempted.getOrDefault(t.name, 0)
+                logMode("候选[通过规则，历史尝试" + attempted.getOrDefault(stableTaskId(t), 0)
                         + "次] raw=" + rawName);
                 chosen = t;
                 break;
@@ -664,8 +665,25 @@ public class AutomationService extends Service {
         return !tasks.isEmpty() && actionRows >= 2;
     }
 
+    /**
+     * 稳定任务身份，用于 attempted 重试计数。默认返回任务名（含进度，进度增长即新身份，
+     * 保证 (0/5)→(1/5) 可继续执行）。对“淘金币省钱等级考试”这类 OCR 易抖动的任务
+     * （“等级”→“等圾”）返回确定性身份，避免同一题因文字抖动被当作新任务反复执行。
+     */
+    private String stableTaskId(TaskParser.TaskItem t) {
+        if (isCoinExamTask(t.name)) return "exam:coin_saving_exam";
+        return t.name;
+    }
+
+    /** 受限匹配“淘金币省钱等级考试”及其 OCR 变体（等级→等圾），不做全局模糊合并。 */
+    private boolean isCoinExamTask(String name) {
+        String norm = TaskRuleStore.normalizeKeyword(name);
+        if (!norm.contains("考试")) return false;
+        return norm.contains("省钱") || norm.contains("等级") || norm.contains("等圾");
+    }
+
     private void executeTask(TaskParser.TaskItem task, int width, int height) throws Exception {
-        attempted.put(task.name, attempted.getOrDefault(task.name, 0) + 1);
+        attempted.put(stableTaskId(task), attempted.getOrDefault(stableTaskId(task), 0) + 1);
         executedCount++;
         AppState.status = "执行: " + task.name;
         boolean externalTask = TaskParser.external(task, taskRules);
@@ -681,6 +699,7 @@ public class AutomationService extends Service {
         // 不含“答题”所以可通过，但用户加了“考试”等词就会被拦）。未命中才进入专用流程。
         QuizPageInfo quiz = detectQuizPageWithRetry(2);
         if (quiz != null) {
+            logMode("分类：" + task.name + " -> QUIZ（黑名单未命中）");
             handleQuizTask(quiz);
             if (stopRequested) return;
             returnToTaskList(currentMode);
@@ -1023,71 +1042,123 @@ public class AutomationService extends Service {
         final Map<String, int[]> options;
         final boolean feedbackVisible;
         final boolean rewardVisible;
+        /** 题型标签：单选/多选，空串表示 OCR 未识别出题型词。 */
+        final String choiceType;
 
-        QuizPageInfo(Map<String, int[]> options, boolean feedbackVisible, boolean rewardVisible) {
+        QuizPageInfo(Map<String, int[]> options, boolean feedbackVisible, boolean rewardVisible,
+                     String choiceType) {
             this.options = options;
             this.feedbackVisible = feedbackVisible;
             this.rewardVisible = rewardVisible;
+            this.choiceType = choiceType == null ? "" : choiceType;
         }
     }
 
     /**
-     * 淘金币答题页严格认证：必须同时看到“淘金币答题/每日答题”标题锚与“单选题”，
-     * 并定位到明确的 A/B/C/D 选项（或已作答反馈）。仅凭“答题”两字绝不在其他页面触发，
-     * 也绝不为了答题绕过 skip()——黑名单拦截发生在候选循环，未命中才进入本流程。
+     * 淘金币答题页认证：只要出现“淘金币答题/每日答题”强标题即视为答题页（并返回，
+     * 交由 handleQuizTask 对缺 A / 缺题型等情形安全退出，绝不回退为 22 秒浏览）。
+     * 兼容 单选题/多选题，选项数量 2–4（A 必须、B 合理识别），优先元素级单字母，
+     * 行级允许“A1999年”这类合并文本；选项必须在标题之下、“我选好了”按钮之上，
+     * 不匹配标题/商品文字里的普通英文字母。仅凭“答题”两字绝不触发。
      */
     private QuizPageInfo buildQuizPageInfo(OcrEngine.Snapshot snap) {
         if (snap == null) return null;
         String all = normalizeOcr(snap.allText());
         boolean titleAnchor = all.contains("淘金币答题") || all.contains("每日答题");
-        boolean singleChoice = all.contains("单选题") || all.contains("单选");
-        if (!titleAnchor || !singleChoice) return null;
+        if (!titleAnchor) return null;
 
-        Map<String, int[]> options = new HashMap<>();
+        String choiceType = all.contains("多选题") || all.contains("多选")
+                ? "多选"
+                : (all.contains("单选题") || all.contains("单选") ? "单选" : "");
+
+        int titleBottom = -1;
+        int submitY = -1;
         for (OcrEngine.OcrRow row : snap.rows) {
             String t = normalizeOcr(row.text);
-            if (t.length() < 1 || t.length() > 10) continue;
-            for (String letter : new String[]{"A", "B", "C", "D"}) {
-                if (options.containsKey(letter)) continue;
-                boolean hit = t.equals(letter)
-                        || (t.startsWith(letter) && t.length() >= 2 && t.length() <= 8);
-                if (hit) options.put(letter, new int[]{row.bounds.centerX(), row.bounds.centerY()});
+            if (titleBottom < 0 && (t.contains("淘金币答题") || t.contains("每日答题"))) {
+                titleBottom = row.bounds.bottom;
+            }
+            if (submitY < 0 && t.contains("我选好了")) {
+                submitY = row.bounds.centerY();
             }
         }
+
+        Map<String, int[]> options = new HashMap<>();
+        // 1) 元素级单字母 A/B/C/D（最可靠）
         if (snap.elements != null) {
             for (OcrEngine.OcrRow e : snap.elements) {
                 String t = normalizeOcr(e.text);
-                if (t.length() == 1 && "ABCD".contains(t)) {
-                    options.putIfAbsent(t, new int[]{e.bounds.centerX(), e.bounds.centerY()});
-                }
+                if (t.length() != 1 || "ABCD".indexOf(t.charAt(0)) < 0) continue;
+                int cy = e.bounds.centerY();
+                if (titleBottom > 0 && cy < titleBottom) continue;
+                if (submitY > 0 && cy > submitY) continue;
+                options.putIfAbsent(t, new int[]{e.bounds.centerX(), cy});
             }
+        }
+        // 2) 行级：以 A/B/C/D 开头（如“A1999年”），去掉长度上限假设。
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (t.isEmpty()) continue;
+            char c = t.charAt(0);
+            if (!(c == 'A' || c == 'B' || c == 'C' || c == 'D')) continue;
+            String letter = String.valueOf(c);
+            if (options.containsKey(letter)) continue;
+            int cy = row.bounds.centerY();
+            if (titleBottom > 0 && cy < titleBottom) continue;
+            if (submitY > 0 && cy > submitY) continue;
+            options.put(letter, new int[]{row.bounds.centerX(), cy});
         }
 
         boolean feedbackVisible = all.contains("正确答案") && all.contains("你的答案");
         boolean rewardVisible = all.contains("已成功领取奖励") || all.contains("回到主页");
-        if (options.isEmpty() && !feedbackVisible) return null;
-        return new QuizPageInfo(options, feedbackVisible, rewardVisible);
+        return new QuizPageInfo(options, feedbackVisible, rewardVisible, choiceType);
     }
 
     private QuizPageInfo detectQuizPageWithRetry(int maxAttempts) throws Exception {
         for (int i = 1; i <= maxAttempts && !stopRequested; i++) {
+            OcrEngine.Snapshot snap = null;
             try {
-                QuizPageInfo quiz = buildQuizPageInfo(ocr.capture());
-                if (quiz != null) return quiz;
+                snap = ocr.captureQuizPage();
             } catch (Throwable e) {
-                logMode("答题页 OCR 检测失败 (" + i + "/" + maxAttempts + "): " + e.getMessage());
+                logMode("答题页 OCR 失败 (" + i + "/" + maxAttempts + "): " + e.getMessage());
+            }
+            if (snap != null) {
+                QuizPageInfo quiz = buildQuizPageInfo(snap);
+                if (quiz != null) return quiz;
+                if (i == maxAttempts) {
+                    String all = normalizeOcr(snap.allText());
+                    String reason = (all.contains("淘金币答题") || all.contains("每日答题"))
+                            ? (all.contains("单选") || all.contains("多选")
+                                ? "missing_option_A" : "missing_choice_type")
+                            : "missing_title";
+                    logMode("QUIZ_DETECT_FAILED: " + reason);
+                }
             }
             if (i < maxAttempts) sleep(1200);
         }
         return null;
     }
 
+    /** 选项字母列表转成可读日志（A,B,C）。 */
+    private String joinOptions(Map<String, int[]> options) {
+        StringBuilder sb = new StringBuilder();
+        for (String letter : new String[]{"A", "B", "C", "D"}) {
+            if (options.containsKey(letter)) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(letter);
+            }
+        }
+        return sb.length() == 0 ? "(无)" : sb.toString();
+    }
+
     /**
-     * 答题专用流程（首版固定选 A，不联网找答案；用户实测错答也可领参与奖励，
-     * 但不假定全时如此——只按页面真实反馈决定后续动作，绝不重复作答）。
+     * 答题专用流程（首版固定选 A，兼容单选/多选、2–4 个选项；多选也只选 A 后提交。
+     * 不联网找答案，只按页面真实反馈决定后续动作，绝不重复作答）。
      */
     private void handleQuizTask(QuizPageInfo quiz) throws Exception {
-        logMode("已严格认证淘金币答题页面（标题+单选题+选项），进入专用答题流程");
+        logMode("答题页认证：标题=淘金币答题 题型="
+                + (quiz.choiceType.isEmpty() ? "未识别" : quiz.choiceType)
+                + " 选项=" + joinOptions(quiz.options));
 
         if (quiz.rewardVisible) {
             clickQuizReturnHome();
@@ -1096,28 +1167,28 @@ public class AutomationService extends Service {
 
         int[] optionA = quiz.options.get("A");
         if (optionA == null) {
-            logMode("未定位到 A 选项，安全停止答题并返回任务列表");
+            logMode("答题页缺 A 选项，安全退出该项（不转为浏览），返回任务列表");
             return;
         }
         shellTap(optionA[0], optionA[1]);
-        logMode("已点击答题选项 A（首版固定 A，不自动寻找正确答案）");
+        logMode("点击 A：OCR 定位确认 (" + optionA[0] + "," + optionA[1] + ")");
         sleep(1200);
         if (stopRequested) return;
 
-        OcrEngine.Snapshot afterSelect = ocr.capture();
+        OcrEngine.Snapshot afterSelect = ocr.captureQuizPage();
         int[] submit = findTextPoint(afterSelect, "我选好了", false);
         if (submit != null) {
             shellTap(submit[0], submit[1]);
-            logMode("已点击“我选好了”提交答案");
+            logMode("点击“我选好了”提交");
             sleep(2200);
         } else {
-            logMode("未看到“我选好了”提交按钮，按页面当前状态复查反馈");
+            logMode("未看到“我选好了”提交按钮，按页面当前状态复查反馈（不无限点击）");
         }
         if (stopRequested) return;
 
-        QuizPageInfo feedback = buildQuizPageInfo(ocr.capture());
+        QuizPageInfo feedback = buildQuizPageInfo(ocr.captureQuizPage());
         if (feedback != null && feedback.rewardVisible) {
-            logMode("答题反馈：已确认领奖/返回提示");
+            logMode("答题反馈：已成功领取奖励 / 出现返回提示");
             clickQuizReturnHome();
         } else {
             logMode("答题后未确认领奖反馈，安全返回任务列表（不重复作答）");
@@ -1126,7 +1197,7 @@ public class AutomationService extends Service {
 
     /** 点击“已成功领取奖励 回到主页”按钮；定位不到时仅记录，不盲点坐标。 */
     private void clickQuizReturnHome() throws Exception {
-        OcrEngine.Snapshot snap = ocr.capture();
+        OcrEngine.Snapshot snap = ocr.captureQuizPage();
         int[] home = findTextPoint(snap, "回到主页", false);
         if (home == null) home = findTextPoint(snap, "已成功领取奖励", false);
         if (home != null) {
@@ -2016,7 +2087,7 @@ public class AutomationService extends Service {
                 logMode("收尾复查跳过[" + skipReason + "]: " + task.name);
                 continue;
             }
-            if (attempted.getOrDefault(task.name, 0) >= 2) {
+            if (attempted.getOrDefault(stableTaskId(task), 0) >= 2) {
                 logMode("收尾复查发现未完成任务但已达到尝试上限，跳过: " + task.name);
                 continue;
             }
@@ -2178,7 +2249,7 @@ public class AutomationService extends Service {
                 logMode("收尾复查跳过[" + skipReason + "]: " + task.name);
                 continue;
             }
-            if (attempted.getOrDefault(task.name, 0) >= 2) {
+            if (attempted.getOrDefault(stableTaskId(task), 0) >= 2) {
                 logMode("收尾复查发现未完成任务但已达到尝试上限，跳过: " + task.name);
                 continue;
             }
