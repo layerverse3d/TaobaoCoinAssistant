@@ -39,6 +39,10 @@ public class MainActivity extends Activity {
     private TextView logText;
     private ScrollView logScroll;
     private long lastRenderedLogVersion = -1L;
+    // 日志默认自动跟随最新一行；用户手动向上翻阅历史时暂停跟随。
+    private boolean followLatest = true;
+    // 程序触发的 scrollTo/fullScroll 期间置位，避免被误判为用户拖动。
+    private boolean suppressScrollListener = false;
 
     private final Shizuku.OnRequestPermissionResultListener shizukuPermissionListener = (requestCode, grantResult) -> {
         if (requestCode == REQ_SHIZUKU) {
@@ -132,7 +136,7 @@ public class MainActivity extends Activity {
         sub.setPadding(0, dp(6), 0, 0);
         heroText.addView(sub);
 
-        TextView version = pill("v1.2-d11-fix2", 0x33FFFFFF, 0xFFFFFFFF);
+        TextView version = pill("v1.2-d11-fix3", 0x33FFFFFF, 0xFFFFFFFF);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(-2, -2);
         verLp.topMargin = dp(8);
         heroText.addView(version, verLp);
@@ -255,6 +259,14 @@ public class MainActivity extends Activity {
         logTitle.setTextColor(0xFF111827);
         logHeader.addView(logTitle, new LinearLayout.LayoutParams(0, -2, 1));
 
+        Button latestLog = ghostButton("↓ 最新");
+        latestLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        latestLog.setOnClickListener(v -> {
+            followLatest = true;
+            scrollLogToBottom();
+        });
+        logHeader.addView(latestLog, new LinearLayout.LayoutParams(-2, dp(42)));
+
         Button copyLog = ghostButton("复制日志");
         copyLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         copyLog.setOnClickListener(v -> {
@@ -277,9 +289,21 @@ public class MainActivity extends Activity {
         logText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
         logText.setTextColor(0xFF1F2937);
         logText.setPadding(dp(12), dp(12), dp(12), dp(12));
-        logText.setTextIsSelectable(true);
+        // 取消长按选择（已有“复制日志”按钮），避免可选中文本吞掉滚动手势。
+        logText.setTextIsSelectable(false);
         logScroll.addView(logText);
         root.addView(logScroll, logLp);
+
+        // 内层日志滚动：日志框内触摸时请求父级 pageScroll 不拦截，保证手势顺畅。
+        logScroll.setOnTouchListener((v, event) -> {
+            v.getParent().requestDisallowInterceptTouchEvent(true);
+            return false;
+        });
+        // 根据滚动位置更新跟随状态：用户滚到底部即恢复自动跟随，否则暂停。
+        logScroll.setOnScrollChangeListener((v, sx, sy, ox, oy) -> {
+            if (suppressScrollListener) return;
+            followLatest = isLogNearBottom();
+        });
 
         pageScroll.addView(root, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT,
@@ -491,17 +515,25 @@ public class MainActivity extends Activity {
         long version = AppState.logsVersion();
         if (version == lastRenderedLogVersion || logScroll == null || logText == null) return;
 
-        final boolean wasAtBottom = isLogNearBottom();
         final int savedY = logScroll.getScrollY();
         logText.setText(AppState.logs());
         lastRenderedLogVersion = version;
 
+        if (followLatest) {
+            scrollLogToBottom();
+        } else {
+            // 手动翻阅历史期间保持阅读位置，不打断用户。
+            logScroll.post(() -> logScroll.scrollTo(0, savedY));
+        }
+    }
+
+    /** 程序触发的滚动到底部：抑制滚动监听，避免被误判为用户操作。 */
+    private void scrollLogToBottom() {
+        if (logScroll == null) return;
+        suppressScrollListener = true;
         logScroll.post(() -> {
-            if (wasAtBottom) {
-                logScroll.fullScroll(View.FOCUS_DOWN);
-            } else {
-                logScroll.scrollTo(0, savedY);
-            }
+            logScroll.fullScroll(View.FOCUS_DOWN);
+            logScroll.post(() -> suppressScrollListener = false);
         });
     }
 
