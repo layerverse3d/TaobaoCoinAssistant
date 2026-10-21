@@ -574,6 +574,17 @@ public class AutomationService extends Service {
         sleep(3500);
         if (stopRequested) return;
 
+        // 答题页强认证分流：黑名单已在候选循环 skip（如“淘金币省钱等级考试”默认
+        // 不含“答题”所以可通过，但用户加了“考试”等词就会被拦）。未命中才进入专用流程。
+        QuizPageInfo quiz = detectQuizPageWithRetry(2);
+        if (quiz != null) {
+            handleQuizTask(quiz);
+            if (stopRequested) return;
+            returnToTaskList(currentMode);
+            if (!stopRequested) AppState.status = "识别任务中";
+            return;
+        }
+
         if (searchTask) {
             boolean submitted = handleSearchTask();
             if (stopRequested) return;
@@ -901,6 +912,126 @@ public class AutomationService extends Service {
             this.inputY = inputY;
             this.searchX = searchX;
             this.searchY = searchY;
+        }
+    }
+
+    /** 淘金币答题页识别结果：选项坐标、是否已出反馈、是否出现领奖/返回提示。 */
+    private static final class QuizPageInfo {
+        final Map<String, int[]> options;
+        final boolean feedbackVisible;
+        final boolean rewardVisible;
+
+        QuizPageInfo(Map<String, int[]> options, boolean feedbackVisible, boolean rewardVisible) {
+            this.options = options;
+            this.feedbackVisible = feedbackVisible;
+            this.rewardVisible = rewardVisible;
+        }
+    }
+
+    /**
+     * 淘金币答题页严格认证：必须同时看到“淘金币答题/每日答题”标题锚与“单选题”，
+     * 并定位到明确的 A/B/C/D 选项（或已作答反馈）。仅凭“答题”两字绝不在其他页面触发，
+     * 也绝不为了答题绕过 skip()——黑名单拦截发生在候选循环，未命中才进入本流程。
+     */
+    private QuizPageInfo buildQuizPageInfo(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        String all = normalizeOcr(snap.allText());
+        boolean titleAnchor = all.contains("淘金币答题") || all.contains("每日答题");
+        boolean singleChoice = all.contains("单选题") || all.contains("单选");
+        if (!titleAnchor || !singleChoice) return null;
+
+        Map<String, int[]> options = new HashMap<>();
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (t.length() < 1 || t.length() > 10) continue;
+            for (String letter : new String[]{"A", "B", "C", "D"}) {
+                if (options.containsKey(letter)) continue;
+                boolean hit = t.equals(letter)
+                        || (t.startsWith(letter) && t.length() >= 2 && t.length() <= 8);
+                if (hit) options.put(letter, new int[]{row.bounds.centerX(), row.bounds.centerY()});
+            }
+        }
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                String t = normalizeOcr(e.text);
+                if (t.length() == 1 && "ABCD".contains(t)) {
+                    options.putIfAbsent(t, new int[]{e.bounds.centerX(), e.bounds.centerY()});
+                }
+            }
+        }
+
+        boolean feedbackVisible = all.contains("正确答案") && all.contains("你的答案");
+        boolean rewardVisible = all.contains("已成功领取奖励") || all.contains("回到主页");
+        if (options.isEmpty() && !feedbackVisible) return null;
+        return new QuizPageInfo(options, feedbackVisible, rewardVisible);
+    }
+
+    private QuizPageInfo detectQuizPageWithRetry(int maxAttempts) throws Exception {
+        for (int i = 1; i <= maxAttempts && !stopRequested; i++) {
+            try {
+                QuizPageInfo quiz = buildQuizPageInfo(ocr.capture());
+                if (quiz != null) return quiz;
+            } catch (Throwable e) {
+                logMode("答题页 OCR 检测失败 (" + i + "/" + maxAttempts + "): " + e.getMessage());
+            }
+            if (i < maxAttempts) sleep(1200);
+        }
+        return null;
+    }
+
+    /**
+     * 答题专用流程（首版固定选 A，不联网找答案；用户实测错答也可领参与奖励，
+     * 但不假定全时如此——只按页面真实反馈决定后续动作，绝不重复作答）。
+     */
+    private void handleQuizTask(QuizPageInfo quiz) throws Exception {
+        logMode("已严格认证淘金币答题页面（标题+单选题+选项），进入专用答题流程");
+
+        if (quiz.rewardVisible) {
+            clickQuizReturnHome();
+            return;
+        }
+
+        int[] optionA = quiz.options.get("A");
+        if (optionA == null) {
+            logMode("未定位到 A 选项，安全停止答题并返回任务列表");
+            return;
+        }
+        shellTap(optionA[0], optionA[1]);
+        logMode("已点击答题选项 A（首版固定 A，不自动寻找正确答案）");
+        sleep(1200);
+        if (stopRequested) return;
+
+        OcrEngine.Snapshot afterSelect = ocr.capture();
+        int[] submit = findTextPoint(afterSelect, "我选好了", false);
+        if (submit != null) {
+            shellTap(submit[0], submit[1]);
+            logMode("已点击“我选好了”提交答案");
+            sleep(2200);
+        } else {
+            logMode("未看到“我选好了”提交按钮，按页面当前状态复查反馈");
+        }
+        if (stopRequested) return;
+
+        QuizPageInfo feedback = buildQuizPageInfo(ocr.capture());
+        if (feedback != null && feedback.rewardVisible) {
+            logMode("答题反馈：已确认领奖/返回提示");
+            clickQuizReturnHome();
+        } else {
+            logMode("答题后未确认领奖反馈，安全返回任务列表（不重复作答）");
+        }
+    }
+
+    /** 点击“已成功领取奖励 回到主页”按钮；定位不到时仅记录，不盲点坐标。 */
+    private void clickQuizReturnHome() throws Exception {
+        OcrEngine.Snapshot snap = ocr.capture();
+        int[] home = findTextPoint(snap, "回到主页", false);
+        if (home == null) home = findTextPoint(snap, "已成功领取奖励", false);
+        if (home != null) {
+            shellTap(home[0], home[1]);
+            logMode("已点击“回到主页”返回");
+            sleep(2200);
+        } else {
+            logMode("未定位到“回到主页”按钮，交由返回流程恢复任务列表");
         }
     }
 
