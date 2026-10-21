@@ -62,6 +62,11 @@ android {
         targetCompatibility JavaVersion.VERSION_17
         coreLibraryDesugaringEnabled true
     }
+
+    // AGP 8 默认不生成 BuildConfig；ShizukuShell 需要 BuildConfig.APPLICATION_ID。
+    buildFeatures {
+        buildConfig true
+    }
 }
 
 dependencies {
