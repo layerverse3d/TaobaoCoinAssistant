@@ -2578,7 +2578,7 @@ public class AutomationService extends Service {
      * 每次动作后截图复查；全程不点击“去浏览加抵好物”购物 CTA。总上限 3 次，
      * 超限后交由页面恢复流程/人工处理。
      */
-    private boolean handlePromoOverlay(OcrEngine.Snapshot snap, String stage) throws Exception {
+    private boolean handlePromoOverlay(OcrEngine.Snapshot snap, String stage) {
         if (promoOverlayActions >= 3) {
             logMode("promoOverlay=true page=" + stage
                     + " action=GIVE_UP（已达 3 次处理上限，不点购物 CTA，交由页面恢复/人工处理）");
@@ -2602,7 +2602,11 @@ public class AutomationService extends Service {
                     + " action=SAFE_X（" + x[0] + "," + x[1] + "）（" + promoOverlayActions + "/3）");
             shellTap(x[0], x[1]);
         }
-        sleep(900);
+        try {
+            sleep(900);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
         boolean recovered = false;
         try {
             OcrEngine.Snapshot check = ocr.captureNavigation();
