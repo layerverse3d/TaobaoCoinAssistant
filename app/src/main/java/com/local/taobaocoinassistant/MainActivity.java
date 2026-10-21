@@ -132,7 +132,7 @@ public class MainActivity extends Activity {
         sub.setPadding(0, dp(6), 0, 0);
         heroText.addView(sub);
 
-        TextView version = pill("v1.1", 0x33FFFFFF, 0xFFFFFFFF);
+        TextView version = pill("v1.2-d11", 0x33FFFFFF, 0xFFFFFFFF);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(-2, -2);
         verLp.topMargin = dp(8);
         heroText.addView(version, verLp);
@@ -162,18 +162,28 @@ public class MainActivity extends Activity {
         row1.addView(shi, new LinearLayout.LayoutParams(-1, dp(48)));
         root.addView(row1);
 
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        row2.setPadding(0, dp(10), 0, 0);
-        Button start = primaryButton("开始执行");
-        start.setOnClickListener(v -> startAutomation());
-        row2.addView(start, new LinearLayout.LayoutParams(0, dp(48), 1));
-        Button stop = dangerButton("停止");
+        // 三个操作按钮纵向排列：两个开始入口 + 独立全宽停止。
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.VERTICAL);
+        actions.setPadding(0, dp(10), 0, 0);
+
+        Button startCoin = primaryButton("开始执行赚金币");
+        startCoin.setOnClickListener(v -> startAutomation(TaskMode.COIN));
+        actions.addView(startCoin, new LinearLayout.LayoutParams(-1, dp(52)));
+
+        Button startEnergy = primaryButton("开始执行双11赚能量");
+        startEnergy.setOnClickListener(v -> startAutomation(TaskMode.DOUBLE11_ENERGY));
+        LinearLayout.LayoutParams seLp = new LinearLayout.LayoutParams(-1, dp(52));
+        seLp.topMargin = dp(10);
+        actions.addView(startEnergy, seLp);
+
+        Button stop = dangerButton("停止执行");
         stop.setOnClickListener(v -> AutomationService.requestStop(this));
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(0, dp(48), 1);
-        sp.setMarginStart(dp(10));
-        row2.addView(stop, sp);
-        root.addView(row2);
+        LinearLayout.LayoutParams stopLp = new LinearLayout.LayoutParams(-1, dp(52));
+        stopLp.topMargin = dp(10);
+        actions.addView(stop, stopLp);
+
+        root.addView(actions);
 
         LinearLayout overlayRow = cardLayout();
         overlayRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -445,7 +455,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void startAutomation() {
+    private void startAutomation(TaskMode mode) {
         if (!ShizukuShell.hasPermission()) {
             Toast.makeText(this, "请先启动并授权 Shizuku", Toast.LENGTH_LONG).show();
             requestShizuku();
@@ -455,7 +465,7 @@ public class MainActivity extends Activity {
         if (OverlaySettings.isEnabled(this) && !Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "悬浮窗权限未授予；任务仍会执行，但顶部状态条不会显示", Toast.LENGTH_LONG).show();
         }
-        AutomationService.start(this);
+        AutomationService.start(this, mode);
     }
 
     private void refresh() {
