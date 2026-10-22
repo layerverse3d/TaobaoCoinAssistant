@@ -136,7 +136,7 @@ public class MainActivity extends Activity {
         sub.setPadding(0, dp(6), 0, 0);
         heroText.addView(sub);
 
-        TextView version = pill("v1.2-d11-fix5", 0x33FFFFFF, 0xFFFFFFFF);
+        TextView version = pill("v1.2-d11-fix6", 0x33FFFFFF, 0xFFFFFFFF);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(-2, -2);
         verLp.topMargin = dp(8);
         heroText.addView(version, verLp);
@@ -171,11 +171,11 @@ public class MainActivity extends Activity {
         actions.setOrientation(LinearLayout.VERTICAL);
         actions.setPadding(0, dp(10), 0, 0);
 
-        Button startCoin = primaryButton("开始执行赚金币");
+        Button startCoin = primaryButton("🪙 开始执行赚金币");
         startCoin.setOnClickListener(v -> startAutomation(TaskMode.COIN));
         actions.addView(startCoin, new LinearLayout.LayoutParams(-1, dp(52)));
 
-        Button startEnergy = primaryButton("开始执行双11赚能量");
+        Button startEnergy = primaryButton("⚡ 开始执行双11赚能量");
         startEnergy.setOnClickListener(v -> startAutomation(TaskMode.DOUBLE11_ENERGY));
         LinearLayout.LayoutParams seLp = new LinearLayout.LayoutParams(-1, dp(52));
         seLp.topMargin = dp(10);
@@ -249,15 +249,18 @@ public class MainActivity extends Activity {
         root.addView(statusText, statusLp);
 
         LinearLayout logHeader = new LinearLayout(this);
-        logHeader.setOrientation(LinearLayout.HORIZONTAL);
-        logHeader.setGravity(Gravity.CENTER_VERTICAL);
+        logHeader.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout logRow1 = new LinearLayout(this);
+        logRow1.setOrientation(LinearLayout.HORIZONTAL);
+        logRow1.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView logTitle = new TextView(this);
         logTitle.setText("运行日志");
         logTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         logTitle.setTypeface(Typeface.DEFAULT_BOLD);
         logTitle.setTextColor(0xFF111827);
-        logHeader.addView(logTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        logRow1.addView(logTitle, new LinearLayout.LayoutParams(0, -2, 1));
 
         Button latestLog = ghostButton("↓ 最新");
         latestLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
@@ -265,7 +268,7 @@ public class MainActivity extends Activity {
             followLatest = true;
             scrollLogToBottom();
         });
-        logHeader.addView(latestLog, new LinearLayout.LayoutParams(-2, dp(42)));
+        logRow1.addView(latestLog, new LinearLayout.LayoutParams(-2, dp(42)));
 
         Button copyLog = ghostButton("复制日志");
         copyLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
@@ -274,7 +277,34 @@ public class MainActivity extends Activity {
             cb.setPrimaryClip(ClipData.newPlainText("淘金币助手运行日志", AppState.logs()));
             Toast.makeText(this, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show();
         });
-        logHeader.addView(copyLog, new LinearLayout.LayoutParams(-2, dp(42)));
+        logRow1.addView(copyLog, new LinearLayout.LayoutParams(-2, dp(42)));
+        logHeader.addView(logRow1);
+
+        // 第二行工具栏：清空日志（单独一行，避免挤压标题与已有按钮）。
+        LinearLayout logRow2 = new LinearLayout(this);
+        logRow2.setOrientation(LinearLayout.HORIZONTAL);
+        logRow2.setGravity(Gravity.CENTER_VERTICAL);
+        logRow2.setPadding(0, dp(8), 0, 0);
+
+        Button clearLog = ghostButton("清空日志");
+        clearLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        clearLog.setOnClickListener(v -> {
+            new AlertDialog.Builder(this)
+                    .setTitle("清空日志")
+                    .setMessage("清空当前运行日志？不会停止正在执行的任务。")
+                    .setPositiveButton("清空", (d, w) -> {
+                        AppState.clearLogs();
+                        lastRenderedLogVersion = -1L;
+                        followLatest = true;
+                        refreshLogsWithoutJumping();
+                        Toast.makeText(this, "日志已清空", Toast.LENGTH_SHORT).show();
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+        });
+        logRow2.addView(clearLog, new LinearLayout.LayoutParams(-1, dp(42)));
+        logHeader.addView(logRow2);
+
         root.addView(logHeader);
 
         logScroll = new ScrollView(this);
