@@ -1337,7 +1337,7 @@ public class AutomationService extends Service {
                     return true;
                 }
             } else {
-                logMode("已到淘金币页面，直接处理签到/赚更多金币");
+                logMode("已到淘金币首页，打开金币任务面板（季节首页优先左侧去赚金币，兼容旧版）");
                 if (openTaskPanel()) {
                     logMode("已进入淘金币任务列表");
                     return true;
@@ -1447,6 +1447,13 @@ public class AutomationService extends Service {
         }
 
         if (first != null) {
+            // 新季节双十一赛车首页：左下“去赚金币”优先；旧版中央“赚更多金币”仅作 fallback。
+            // 只有季节首页特征成立才走左侧入口，避免在新首页中央盲点装饰。
+            if (isSeasonalCoinHome(first)) {
+                if (openSeasonalCoinPanel(first)) return true;
+                return false;
+            }
+
             int[] sign = findOcrTextCenter(first, "签到领金币");
             if (sign == null) sign = findOcrTextCenter(first, "签到领淘金币");
             if (sign != null) {
@@ -1473,6 +1480,80 @@ public class AutomationService extends Service {
 
         // Only use the slower retry path when the first fast frame was genuinely inconclusive.
         return clickMoreCoinsAndConfirm(3);
+    }
+
+    /** 新季节双十一赛车首页：以左下“去赚金币”强锚（旧版为“赚更多金币”）判定。 */
+    private boolean isSeasonalCoinHome(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        return normalizeOcr(snap.allText()).contains("去赚金币");
+    }
+
+    /**
+     * 新版赛车首页左侧“去赚金币”入口定位：优先元素级，其次行级合并
+     * （如“去赚金币 去赚能量”一行）按子串相对位置定位，且要求落在左侧按钮区；
+     * y 比例仅用于限制候选区域，不做盲点兜底。
+     */
+    private int[] findCoinEntryPoint(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        int minY = (int) (snap.height * 0.35f);
+        int maxY = (int) (snap.height * 0.62f);
+
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                String t = normalizeOcr(e.text);
+                if (!(t.equals("去赚金币") || t.equals("赚金币"))) continue;
+                int cy = e.bounds.centerY();
+                if (cy < minY || cy > maxY) continue;
+                int cx = e.bounds.centerX();
+                if (cx > snap.width * 0.55f) continue;  // 仅左侧按钮区
+                return new int[]{cx, cy};
+            }
+        }
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (!t.contains("去赚金币")) continue;
+            int cy = row.bounds.centerY();
+            if (cy < minY || cy > maxY) continue;
+            int idx = t.indexOf("去赚金币");
+            float charCenter = idx + 2.0f;
+            float ratio = charCenter / Math.max(1f, t.length());
+            int x = row.bounds.left + Math.round(row.bounds.width() * ratio);
+            if (x > snap.width * 0.55f) continue;
+            return new int[]{Math.max(24, Math.min(snap.width - 24, x)), cy};
+        }
+        return null;
+    }
+
+    /** 季节赛车首页：点击左侧“去赚金币”并确认金币任务面板打开，有限次重试。 */
+    private boolean openSeasonalCoinPanel(OcrEngine.Snapshot first) throws Exception {
+        logMode("COIN_HOME_VARIANT=DOUBLE11_RACE evidence=去赚金币");
+        for (int attempt = 1; attempt <= 3 && !stopRequested; attempt++) {
+            OcrEngine.Snapshot snap = (attempt == 1) ? first : ocr.captureNavigation();
+            if (snap == null) {
+                sleep(600);
+                continue;
+            }
+            if (taskPanelVisibleInSnapshot(snap)) {
+                logMode("COIN_PANEL_VERIFY trusted=true（金币任务面板已打开）");
+                return ensureTaskListExpanded();
+            }
+            int[] entry = findCoinEntryPoint(snap);
+            if (entry == null) {
+                logMode("COIN_ENTRY_NOT_FOUND（第 " + attempt + "/3 次未定位到左侧去赚金币）");
+                sleep(600);
+                continue;
+            }
+            shellTap(entry[0], entry[1]);
+            logMode("COIN_ENTRY_TAP left=true (" + entry[0] + "," + entry[1] + ")（第 " + attempt + "/3 次）");
+            sleep(2200);
+            if (isTaskPanelVisibleForNavigation()) {
+                logMode("COIN_PANEL_VERIFY trusted=true（金币任务面板已打开）");
+                return ensureTaskListExpanded();
+            }
+            logMode("COIN_PANEL_UNCONFIRMED（第 " + attempt + "/3 次点击后未确认任务面板）");
+        }
+        logMode("COIN_PANEL_UNCONFIRMED 季节入口多次未确认；OCR 摘要: " + summarizeOcrSnippet(first));
+        return false;
     }
 
     /**
