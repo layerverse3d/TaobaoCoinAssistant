@@ -696,6 +696,14 @@ public class AutomationService extends Service {
         AppState.status = "执行: " + task.name;
         boolean externalTask = TaskParser.external(task, taskRules);
         boolean searchTask = TaskParser.isSearch(task, taskRules);
+        // 能量模式受限搜索候选：OCR 截断的“你喜欢的宝贝(0/5)”仍应按搜索流程执行。
+        boolean energySearchCandidate = currentMode == TaskMode.DOUBLE11_ENERGY
+                && TaskParser.isEnergySearchCandidate(task);
+        if (energySearchCandidate && !searchTask) {
+            logMode("SEARCH_CLASSIFY raw=" + task.name
+                    + " reason=energy_title_variant confidence=candidate");
+        }
+        searchTask = searchTask || energySearchCandidate;
         logMode("准备执行任务[" + TaskParser.displayMode(task, taskRules) + "]: " + task.name);
 
         int x = (int) (width * 0.875f);
@@ -724,15 +732,22 @@ public class AutomationService extends Service {
         }
 
         if (searchTask) {
-            boolean submitted = handleSearchTask();
+            SearchResult result = handleSearchTask();
             if (stopRequested) return;
-            if (!submitted) {
-                // 搜索页没有真正提交关键词时，不要在入口页机械滑动 22 秒。
-                logMode("搜索任务未能提交搜索；直接返回任务列表，不在搜索入口页空滑");
+            if (result == SearchResult.FAILED) {
+                logMode("搜索任务未能打开结果页；直接返回任务列表，不在搜索入口页空滑");
                 returnToTaskList(currentMode);
                 if (!stopRequested) AppState.status = "识别任务中";
                 return;
             }
+            if (result == SearchResult.HANDLED_AND_BROWSED) {
+                // 发现页已点击推荐并浏览约 8 秒，不再额外 22 秒浏览，逐层返回任务列表。
+                logMode("搜索发现页已浏览完成，不额外等待，逐层返回任务列表");
+                returnToTaskList(currentMode);
+                if (!stopRequested) AppState.status = "识别任务中";
+                return;
+            }
+            // SUBMITTED_NEEDS_BROWSE：输入关键词已提交，继续外层 22 秒浏览。
         }
 
         if (stopRequested) return;
@@ -881,7 +896,10 @@ public class AutomationService extends Service {
                 continue;
             }
 
-            logMode("识别到“历史搜索/搜索发现”中间页（不触碰清空/删除历史）");
+            String act = currentForeground().activityName;
+            if (act != null && act.contains(".")) act = act.substring(act.lastIndexOf('.') + 1);
+            logMode("SEARCH_CONTEXT activity=" + act
+                    + " discovery=true（历史搜索/搜索发现，不触碰清空/删除历史）");
             int[] target = findSearchDiscoveryTarget(snap);
             if (target == null) {
                 logMode("搜索发现页未能安全定位推荐项；回退到输入关键词流程");
@@ -917,14 +935,22 @@ public class AutomationService extends Service {
      * 搜一搜任务：纯 OCR 定位搜索栏，Shizuku 负责聚焦、输入和提交。
      * 不读取 EditText 或 WebView UI tree；搜索页只以截图 OCR 与 Shizuku 输入为准。
      */
-    private boolean handleSearchTask() throws Exception {
+    /** 搜索任务处理结果语义：已浏览 / 需外层继续浏览 / 失败。 */
+    private enum SearchResult {
+        HANDLED_AND_BROWSED,    // 发现页已点击推荐并完成约 8 秒浏览，外层无需再浏览
+        SUBMITTED_NEEDS_BROWSE, // 输入关键词已提交，外层继续 22 秒浏览
+        FAILED                  // 无法认证/打开，安全返回任务列表
+    }
+
+    private SearchResult handleSearchTask() throws Exception {
         AppState.status = "搜索任务：OCR定位搜索框";
 
         // 能量模式：优先处理“历史搜索/搜索发现”中间页（点推荐项 → 浏览 → 逐步返回）。
-        // 返回 null 表示当前不是该中间页或无法安全定位推荐项，回退到原有输入关键词流程。
         if (currentMode == TaskMode.DOUBLE11_ENERGY) {
             Boolean discovery = tryHandleSearchDiscoveryPage();
-            if (discovery != null) return discovery;
+            if (discovery != null) {
+                return discovery ? SearchResult.HANDLED_AND_BROWSED : SearchResult.FAILED;
+            }
         }
 
         for (int attempt = 1; attempt <= 8 && !stopRequested; attempt++) {
@@ -933,8 +959,10 @@ public class AutomationService extends Service {
                 SearchVisualTarget target = findSearchVisualTarget(snap);
                 if (target != null) {
                     logMode("OCR 已定位新版搜索页，搜索栏 y=" + target.inputY + "，使用 Shizuku 输入");
-                    if (submitSearchByVisualTarget(target)) return true;
-                    if (stopRequested) return false;
+                    if (submitSearchByVisualTarget(target)) {
+                        return SearchResult.SUBMITTED_NEEDS_BROWSE;
+                    }
+                    if (stopRequested) return SearchResult.FAILED;
                 } else if (attempt == 1 || attempt == 4 || attempt == 8) {
                     logMode("搜索页 OCR 暂未定位输入栏 (" + attempt + "/8): " + summarizeSearchOcr(snap));
                 }
@@ -947,7 +975,7 @@ public class AutomationService extends Service {
         }
 
         if (!stopRequested) logMode("未能通过 OCR 定位/提交新版搜索框");
-        return false;
+        return SearchResult.FAILED;
     }
 
     private boolean submitSearchByVisualTarget(SearchVisualTarget target) throws Exception {

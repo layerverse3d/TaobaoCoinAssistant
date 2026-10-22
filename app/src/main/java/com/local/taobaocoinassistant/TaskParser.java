@@ -286,6 +286,20 @@ public final class TaskParser {
 
     public static boolean completed(TaskItem t) { return t.current >= t.total; }
 
+    /**
+     * 能量模式搜索候选（受限、可解释）：OCR 常把“搜一搜你喜欢的宝贝”截断为
+     * “你喜欢的宝贝”，导致命中不了用户搜索规则。仅在分母为 5、标题含“喜欢的宝贝”、
+     * 且不含“逛/拍立淘/视频”等明显非搜索词时视为候选；落地页面仍需二次确认，
+     * 不能只凭标题就执行搜索流程。
+     */
+    public static boolean isEnergySearchCandidate(TaskItem t) {
+        if (t == null || t.total != 5) return false;
+        String norm = normalize(t.name);
+        if (!norm.contains("喜欢的宝贝")) return false;
+        if (norm.contains("逛") || norm.contains("拍立淘") || norm.contains("视频")) return false;
+        return true;
+    }
+
     public static boolean skip(TaskItem t, TaskRuleStore.Rules rules) {
         return skipReason(t, rules) != null;
     }
