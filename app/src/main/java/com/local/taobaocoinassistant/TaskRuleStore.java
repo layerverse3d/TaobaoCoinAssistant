@@ -20,8 +20,9 @@ public final class TaskRuleStore {
     private static final String KEY_BROWSE = "browse";
     // 规则迁移版本：一次性、非破坏性地为老版本补充新增的默认黑名单词。
     private static final String KEY_MIGRATION_VERSION = "skip_migration_version";
-    private static final int MIGRATION_VERSION = 1;
+    private static final int MIGRATION_VERSION = 2;
     private static final List<String> MIGRATION_ADDITIONS_V1 = Arrays.asList("淘特", "快手", "微博");
+    private static final List<String> MIGRATION_ADDITIONS_V2 = Arrays.asList("每拉", "天猫积分", "积分换能量");
 
     public static final String DEFAULT_SKIP = String.join("\n", Arrays.asList(
             "淘金币趣味课堂",
@@ -52,7 +53,10 @@ public final class TaskRuleStore {
             "通知",
             "淘特",
             "快手",
-            "微博"
+            "微博",
+            "每拉",
+            "天猫积分",
+            "积分换能量"
     ));
 
     public static final String DEFAULT_EXTERNAL = String.join("\n", Arrays.asList(
@@ -112,10 +116,10 @@ public final class TaskRuleStore {
     }
 
     /**
-     * 一次性、可追踪、非破坏性规则迁移。
-     * 仅当存在用户已保存的 skip 时才把缺失的新增默认词追加一次（保留原词与原顺序）；
-     * 全新安装直接使用扩展后的 DEFAULT_SKIP，无需重复追加。用户后续主动删除这些词，
-     * 因迁移版本已记录，不会被再次加回。
+     * 一次性、可追踪、非破坏性规则迁移（多版本增量）。
+     * 仅当存在用户已保存的 skip 时才把各版本缺失的新增默认词追加一次（保留原词与原顺序）；
+     * 全新安装直接使用扩展后的 DEFAULT_SKIP。用户后续主动删除这些词，因迁移版本已记录，
+     * 不会被再次加回。v1 补 淘特/快手/微博，v2 补 每拉/天猫积分/积分换能量。
      */
     private static synchronized void ensureMigration(Context context) {
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -131,9 +135,9 @@ public final class TaskRuleStore {
         String existing = sp.getString(KEY_SKIP, "");
         List<String> current = parseLines(existing);
         List<String> toAdd = new ArrayList<>();
-        for (String w : MIGRATION_ADDITIONS_V1) {
-            if (!current.contains(normalizeKeyword(w))) toAdd.add(w);
-        }
+        if (done < 1) toAdd.addAll(missingWords(MIGRATION_ADDITIONS_V1, current));
+        if (done < 2) toAdd.addAll(missingWords(MIGRATION_ADDITIONS_V2, current));
+
         if (!toAdd.isEmpty()) {
             StringBuilder sb = new StringBuilder(existing.trim());
             for (String w : toAdd) {
@@ -147,6 +151,15 @@ public final class TaskRuleStore {
         } else {
             sp.edit().putInt(KEY_MIGRATION_VERSION, MIGRATION_VERSION).apply();
         }
+    }
+
+    /** 返回 additions 中不在 current（已归一化）里的词，保持 additions 顺序。 */
+    private static List<String> missingWords(List<String> additions, List<String> current) {
+        List<String> out = new ArrayList<>();
+        for (String w : additions) {
+            if (!current.contains(normalizeKeyword(w))) out.add(w);
+        }
+        return out;
     }
 
     private static List<String> parseLines(String raw) {
