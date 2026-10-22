@@ -69,7 +69,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 8001);
         }
-        AppState.log("应用已打开。淘金币助手 v1.1 为纯 Shizuku + OCR，无需无障碍；首次使用请授权 Shizuku。");
+        AppState.log("应用已打开。淘金币助手 " + BuildConfig.VERSION_NAME + " 基于 Shizuku + OCR，无需无障碍；首次使用请授权 Shizuku。");
         handler.post(ticker);
     }
 
@@ -136,7 +136,7 @@ public class MainActivity extends Activity {
         sub.setPadding(0, dp(6), 0, 0);
         heroText.addView(sub);
 
-        TextView version = pill("v1.2-d11-fix6", 0x33FFFFFF, 0xFFFFFFFF);
+        TextView version = pill("v" + BuildConfig.VERSION_NAME, 0x33FFFFFF, 0xFFFFFFFF);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(-2, -2);
         verLp.topMargin = dp(8);
         heroText.addView(version, verLp);
