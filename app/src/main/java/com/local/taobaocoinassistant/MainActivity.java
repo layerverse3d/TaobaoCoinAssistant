@@ -39,6 +39,10 @@ public class MainActivity extends Activity {
     private TextView logText;
     private ScrollView logScroll;
     private long lastRenderedLogVersion = -1L;
+    // 日志默认自动跟随最新一行；用户手动向上翻阅历史时暂停跟随。
+    private boolean followLatest = true;
+    // 程序触发的 scrollTo/fullScroll 期间置位，避免被误判为用户拖动。
+    private boolean suppressScrollListener = false;
 
     private final Shizuku.OnRequestPermissionResultListener shizukuPermissionListener = (requestCode, grantResult) -> {
         if (requestCode == REQ_SHIZUKU) {
@@ -65,7 +69,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 8001);
         }
-        AppState.log("应用已打开。淘金币助手 v1.1 为纯 Shizuku + OCR，无需无障碍；首次使用请授权 Shizuku。");
+        AppState.log("应用已打开。淘金币助手 " + BuildConfig.VERSION_NAME + " 基于 Shizuku + OCR，无需无障碍；首次使用请授权 Shizuku。");
         handler.post(ticker);
     }
 
@@ -132,7 +136,7 @@ public class MainActivity extends Activity {
         sub.setPadding(0, dp(6), 0, 0);
         heroText.addView(sub);
 
-        TextView version = pill("v1.1", 0x33FFFFFF, 0xFFFFFFFF);
+        TextView version = pill("v" + BuildConfig.VERSION_NAME, 0x33FFFFFF, 0xFFFFFFFF);
         LinearLayout.LayoutParams verLp = new LinearLayout.LayoutParams(-2, -2);
         verLp.topMargin = dp(8);
         heroText.addView(version, verLp);
@@ -162,18 +166,28 @@ public class MainActivity extends Activity {
         row1.addView(shi, new LinearLayout.LayoutParams(-1, dp(48)));
         root.addView(row1);
 
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        row2.setPadding(0, dp(10), 0, 0);
-        Button start = primaryButton("开始执行");
-        start.setOnClickListener(v -> startAutomation());
-        row2.addView(start, new LinearLayout.LayoutParams(0, dp(48), 1));
-        Button stop = dangerButton("停止");
+        // 三个操作按钮纵向排列：两个开始入口 + 独立全宽停止。
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.VERTICAL);
+        actions.setPadding(0, dp(10), 0, 0);
+
+        Button startCoin = primaryButton("🪙 开始执行赚金币");
+        startCoin.setOnClickListener(v -> startAutomation(TaskMode.COIN));
+        actions.addView(startCoin, new LinearLayout.LayoutParams(-1, dp(52)));
+
+        Button startEnergy = primaryButton("⚡ 开始执行双11赚能量");
+        startEnergy.setOnClickListener(v -> startAutomation(TaskMode.DOUBLE11_ENERGY));
+        LinearLayout.LayoutParams seLp = new LinearLayout.LayoutParams(-1, dp(52));
+        seLp.topMargin = dp(10);
+        actions.addView(startEnergy, seLp);
+
+        Button stop = dangerButton("停止执行");
         stop.setOnClickListener(v -> AutomationService.requestStop(this));
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(0, dp(48), 1);
-        sp.setMarginStart(dp(10));
-        row2.addView(stop, sp);
-        root.addView(row2);
+        LinearLayout.LayoutParams stopLp = new LinearLayout.LayoutParams(-1, dp(52));
+        stopLp.topMargin = dp(10);
+        actions.addView(stop, stopLp);
+
+        root.addView(actions);
 
         LinearLayout overlayRow = cardLayout();
         overlayRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -235,15 +249,26 @@ public class MainActivity extends Activity {
         root.addView(statusText, statusLp);
 
         LinearLayout logHeader = new LinearLayout(this);
-        logHeader.setOrientation(LinearLayout.HORIZONTAL);
-        logHeader.setGravity(Gravity.CENTER_VERTICAL);
+        logHeader.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout logRow1 = new LinearLayout(this);
+        logRow1.setOrientation(LinearLayout.HORIZONTAL);
+        logRow1.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView logTitle = new TextView(this);
         logTitle.setText("运行日志");
         logTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         logTitle.setTypeface(Typeface.DEFAULT_BOLD);
         logTitle.setTextColor(0xFF111827);
-        logHeader.addView(logTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        logRow1.addView(logTitle, new LinearLayout.LayoutParams(0, -2, 1));
+
+        Button latestLog = ghostButton("↓ 最新");
+        latestLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        latestLog.setOnClickListener(v -> {
+            followLatest = true;
+            scrollLogToBottom();
+        });
+        logRow1.addView(latestLog, new LinearLayout.LayoutParams(-2, dp(42)));
 
         Button copyLog = ghostButton("复制日志");
         copyLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
@@ -252,7 +277,34 @@ public class MainActivity extends Activity {
             cb.setPrimaryClip(ClipData.newPlainText("淘金币助手运行日志", AppState.logs()));
             Toast.makeText(this, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show();
         });
-        logHeader.addView(copyLog, new LinearLayout.LayoutParams(-2, dp(42)));
+        logRow1.addView(copyLog, new LinearLayout.LayoutParams(-2, dp(42)));
+        logHeader.addView(logRow1);
+
+        // 第二行工具栏：清空日志（单独一行，避免挤压标题与已有按钮）。
+        LinearLayout logRow2 = new LinearLayout(this);
+        logRow2.setOrientation(LinearLayout.HORIZONTAL);
+        logRow2.setGravity(Gravity.CENTER_VERTICAL);
+        logRow2.setPadding(0, dp(8), 0, 0);
+
+        Button clearLog = ghostButton("清空日志");
+        clearLog.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        clearLog.setOnClickListener(v -> {
+            new AlertDialog.Builder(this)
+                    .setTitle("清空日志")
+                    .setMessage("清空当前运行日志？不会停止正在执行的任务。")
+                    .setPositiveButton("清空", (d, w) -> {
+                        AppState.clearLogs();
+                        lastRenderedLogVersion = -1L;
+                        followLatest = true;
+                        refreshLogsWithoutJumping();
+                        Toast.makeText(this, "日志已清空", Toast.LENGTH_SHORT).show();
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+        });
+        logRow2.addView(clearLog, new LinearLayout.LayoutParams(-1, dp(42)));
+        logHeader.addView(logRow2);
+
         root.addView(logHeader);
 
         logScroll = new ScrollView(this);
@@ -267,9 +319,21 @@ public class MainActivity extends Activity {
         logText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
         logText.setTextColor(0xFF1F2937);
         logText.setPadding(dp(12), dp(12), dp(12), dp(12));
-        logText.setTextIsSelectable(true);
+        // 取消长按选择（已有“复制日志”按钮），避免可选中文本吞掉滚动手势。
+        logText.setTextIsSelectable(false);
         logScroll.addView(logText);
         root.addView(logScroll, logLp);
+
+        // 内层日志滚动：日志框内触摸时请求父级 pageScroll 不拦截，保证手势顺畅。
+        logScroll.setOnTouchListener((v, event) -> {
+            v.getParent().requestDisallowInterceptTouchEvent(true);
+            return false;
+        });
+        // 根据滚动位置更新跟随状态：用户滚到底部即恢复自动跟随，否则暂停。
+        logScroll.setOnScrollChangeListener((v, sx, sy, ox, oy) -> {
+            if (suppressScrollListener) return;
+            followLatest = isLogNearBottom();
+        });
 
         pageScroll.addView(root, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT,
@@ -445,7 +509,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void startAutomation() {
+    private void startAutomation(TaskMode mode) {
         if (!ShizukuShell.hasPermission()) {
             Toast.makeText(this, "请先启动并授权 Shizuku", Toast.LENGTH_LONG).show();
             requestShizuku();
@@ -455,7 +519,7 @@ public class MainActivity extends Activity {
         if (OverlaySettings.isEnabled(this) && !Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "悬浮窗权限未授予；任务仍会执行，但顶部状态条不会显示", Toast.LENGTH_LONG).show();
         }
-        AutomationService.start(this);
+        AutomationService.start(this, mode);
     }
 
     private void refresh() {
@@ -481,17 +545,25 @@ public class MainActivity extends Activity {
         long version = AppState.logsVersion();
         if (version == lastRenderedLogVersion || logScroll == null || logText == null) return;
 
-        final boolean wasAtBottom = isLogNearBottom();
         final int savedY = logScroll.getScrollY();
         logText.setText(AppState.logs());
         lastRenderedLogVersion = version;
 
+        if (followLatest) {
+            scrollLogToBottom();
+        } else {
+            // 手动翻阅历史期间保持阅读位置，不打断用户。
+            logScroll.post(() -> logScroll.scrollTo(0, savedY));
+        }
+    }
+
+    /** 程序触发的滚动到底部：抑制滚动监听，避免被误判为用户操作。 */
+    private void scrollLogToBottom() {
+        if (logScroll == null) return;
+        suppressScrollListener = true;
         logScroll.post(() -> {
-            if (wasAtBottom) {
-                logScroll.fullScroll(View.FOCUS_DOWN);
-            } else {
-                logScroll.scrollTo(0, savedY);
-            }
+            logScroll.fullScroll(View.FOCUS_DOWN);
+            logScroll.post(() -> suppressScrollListener = false);
         });
     }
 

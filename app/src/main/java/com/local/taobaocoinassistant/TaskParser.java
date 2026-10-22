@@ -172,6 +172,71 @@ public final class TaskParser {
         return isTrustedTaskList(rows, screenHeight) || isExpandedTaskPanelView(rows, screenHeight);
     }
 
+    /**
+     * 能量任务面板认证（双十一赚能量）。
+     *
+     * <p>强锚点是弹窗标题“做任务赚能量”；顶部“累计任务奖励 / 当前进度”是奖励进度条，
+     * 不是普通任务。认证必须同时具备标题锚点 + 动作按钮证据（或奖励头部 + 动作按钮），
+     * 避免仅凭“能量”两字误点广告/商品。</p>
+     */
+    public static boolean isTrustedEnergyTaskPanel(List<OcrEngine.OcrRow> rows, int screenHeight) {
+        if (rows == null || rows.isEmpty()) return false;
+        String all = allNormalized(rows);
+        boolean titleAnchor = all.contains(normalize("做任务赚能量"));
+        boolean rewardHeader = all.contains(normalize("累计任务奖励")) || all.contains(normalize("当前进度"));
+        int actionRows = countActionRows(rows);
+        List<TaskItem> actionable = parseEnergyActionable(rows, screenHeight);
+
+        if (titleAnchor && rewardHeader && actionRows >= 1) return true;
+        if (titleAnchor && !actionable.isEmpty()) return true;
+        if (rewardHeader && actionRows >= 2 && !actionable.isEmpty()) return true;
+        return false;
+    }
+
+    /**
+     * 能量模式严格解析：只返回“旁边确实存在任务动作按钮”的带进度任务行，
+     * 并额外排除顶部“当前进度 0/50”“累计任务奖励”这类奖励进度（不是任务）。
+     */
+    public static List<TaskItem> parseEnergyActionable(List<OcrEngine.OcrRow> rows, int screenHeight) {
+        List<TaskItem> out = new ArrayList<>();
+        for (TaskItem t : parseActionable(rows, screenHeight)) {
+            String n = normalize(t.name);
+            if (n.startsWith("当前进度") || n.contains("累计任务奖励") || n.contains("次任务")) continue;
+            out.add(t);
+        }
+        return out;
+    }
+
+    /** 能量任务列表底部标记；识别不到时退回“连续无变化即到底”的通用机制。 */
+    public static boolean energyBottomVisible(List<OcrEngine.OcrRow> rows) {
+        String all = allNormalized(rows);
+        return all.contains(normalize("没有更多"))
+                || all.contains(normalize("已经到底"))
+                || all.contains(normalize("到底啦"))
+                || all.contains(normalize("暂无更多"));
+    }
+
+    /**
+     * 解析“当前进度 X/Y”，返回 {current, total}；找不到返回 null。
+     * 用于能量累计任务奖励 5/20/50 门槛判断，不参与任务点击。
+     */
+    public static int[] energyCumulativeProgress(List<OcrEngine.OcrRow> rows) {
+        if (rows == null) return null;
+        for (OcrEngine.OcrRow row : rows) {
+            String n = normalize(row.text);
+            if (!n.contains("当前进度")) continue;
+            Matcher m = PROGRESS.matcher(n);
+            if (m.find()) {
+                try {
+                    int current = parseProgressNumber(m.group(2));
+                    int total = parseProgressNumber(m.group(3));
+                    if (total > 0 && current >= 0 && current <= total) return new int[]{current, total};
+                } catch (Exception ignored) {}
+            }
+        }
+        return null;
+    }
+
     public static int countActionRows(List<OcrEngine.OcrRow> rows) {
         int count = 0;
         for (OcrEngine.OcrRow row : rows) {
@@ -221,13 +286,50 @@ public final class TaskParser {
 
     public static boolean completed(TaskItem t) { return t.current >= t.total; }
 
+    /**
+     * 能量模式搜索候选（受限、可解释）：OCR 常把“搜一搜你喜欢的宝贝”截断为
+     * “你喜欢的宝贝”，导致命中不了用户搜索规则。仅在分母为 5、标题含“喜欢的宝贝”、
+     * 且不含“逛/拍立淘/视频”等明显非搜索词时视为候选；落地页面仍需二次确认，
+     * 不能只凭标题就执行搜索流程。
+     */
+    public static boolean isEnergySearchCandidate(TaskItem t) {
+        if (t == null || t.total != 5) return false;
+        String norm = normalize(t.name);
+        if (!norm.contains("喜欢的宝贝")) return false;
+        if (norm.contains("逛") || norm.contains("拍立淘") || norm.contains("视频")) return false;
+        return true;
+    }
+
     public static boolean skip(TaskItem t, TaskRuleStore.Rules rules) {
-        if (completed(t)) return true;
-        // Blacklist matching is intentionally more tolerant than ordinary routing. OCR frequently
-        // confuses visually similar Chinese characters (e.g. 淘金币趣味课堂 -> 淘全币趣昧课堂).
-        // Short generic rules still require an exact hit; only longer, specific rules get a small
-        // edit-distance allowance to avoid turning the whole classifier fuzzy.
-        return containsAnyFuzzyForBlacklist(t.name, rules.skip);
+        return skipReason(t, rules) != null;
+    }
+
+    /**
+     * 返回跳过原因（用于可诊断决策日志）；null 表示不跳过。
+     * 优先级：已完成 > 命中用户黑名单。external/跨应用名单是执行方式而非黑名单，不在此判定。
+     */
+    public static String skipReason(TaskItem t, TaskRuleStore.Rules rules) {
+        if (completed(t)) return "已完成";
+        String hit = hitBlacklistKeyword(t.name, rules.skip);
+        if (hit != null) return "命中用户黑名单:" + hit;
+        return null;
+    }
+
+    /**
+     * 黑名单命中时返回具体关键词，未命中返回 null。匹配容差与原 skip 逻辑完全一致：
+     * OCR 常把形近字识别错（如 淘金币趣味课堂 -> 淘全币趣昧课堂），短规则仅精确包含，
+     * 较长规则允许少量编辑距离，避免整站模糊。
+     */
+    public static String hitBlacklistKeyword(String name, List<String> words) {
+        String ns = TaskRuleStore.normalizeKeyword(name);
+        for (String word : words) {
+            String nw = TaskRuleStore.normalizeKeyword(word);
+            if (nw.isEmpty()) continue;
+            if (ns.contains(nw)) return word;
+            int maxDistance = nw.length() >= 6 ? 2 : (nw.length() >= 4 ? 1 : 0);
+            if (maxDistance > 0 && fuzzyContains(ns, nw, maxDistance)) return word;
+        }
+        return null;
     }
 
     public static boolean external(TaskItem t, TaskRuleStore.Rules rules) {
@@ -268,20 +370,6 @@ public final class TaskParser {
         String ns = TaskRuleStore.normalizeKeyword(s);
         for (String w : words) {
             if (!w.isEmpty() && ns.contains(TaskRuleStore.normalizeKeyword(w))) return true;
-        }
-        return false;
-    }
-
-    private static boolean containsAnyFuzzyForBlacklist(String s, List<String> words) {
-        String ns = TaskRuleStore.normalizeKeyword(s);
-        for (String word : words) {
-            String nw = TaskRuleStore.normalizeKeyword(word);
-            if (nw.isEmpty()) continue;
-            if (ns.contains(nw)) return true;
-
-            // Keep broad/short rules such as 游戏、下单、UC exact-only.
-            int maxDistance = nw.length() >= 6 ? 2 : (nw.length() >= 4 ? 1 : 0);
-            if (maxDistance > 0 && fuzzyContains(ns, nw, maxDistance)) return true;
         }
         return false;
     }

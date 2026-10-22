@@ -18,6 +18,11 @@ public final class TaskRuleStore {
     private static final String KEY_EXTERNAL = "external";
     private static final String KEY_SEARCH = "search";
     private static final String KEY_BROWSE = "browse";
+    // 规则迁移版本：一次性、非破坏性地为老版本补充新增的默认黑名单词。
+    private static final String KEY_MIGRATION_VERSION = "skip_migration_version";
+    private static final int MIGRATION_VERSION = 2;
+    private static final List<String> MIGRATION_ADDITIONS_V1 = Arrays.asList("淘特", "快手", "微博");
+    private static final List<String> MIGRATION_ADDITIONS_V2 = Arrays.asList("每拉", "天猫积分", "积分换能量");
 
     public static final String DEFAULT_SKIP = String.join("\n", Arrays.asList(
             "淘金币趣味课堂",
@@ -45,7 +50,13 @@ public final class TaskRuleStore {
             "爱心蛋",
             "心蛋",
             "极速版",
-            "通知"
+            "通知",
+            "淘特",
+            "快手",
+            "微博",
+            "每拉",
+            "天猫积分",
+            "积分换能量"
     ));
 
     public static final String DEFAULT_EXTERNAL = String.join("\n", Arrays.asList(
@@ -71,6 +82,7 @@ public final class TaskRuleStore {
     private TaskRuleStore() {}
 
     public static Rules load(Context context) {
+        ensureMigration(context);
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         return new Rules(
                 parseLines(sp.getString(KEY_SKIP, DEFAULT_SKIP)),
@@ -94,13 +106,60 @@ public final class TaskRuleStore {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply();
     }
 
-    public static String getRawSkip(Context context) { return raw(context, KEY_SKIP, DEFAULT_SKIP); }
+    public static String getRawSkip(Context context) { ensureMigration(context); return raw(context, KEY_SKIP, DEFAULT_SKIP); }
     public static String getRawExternal(Context context) { return raw(context, KEY_EXTERNAL, DEFAULT_EXTERNAL); }
     public static String getRawSearch(Context context) { return raw(context, KEY_SEARCH, DEFAULT_SEARCH); }
     public static String getRawBrowse(Context context) { return raw(context, KEY_BROWSE, DEFAULT_BROWSE); }
 
     private static String raw(Context context, String key, String def) {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(key, def);
+    }
+
+    /**
+     * 一次性、可追踪、非破坏性规则迁移（多版本增量）。
+     * 仅当存在用户已保存的 skip 时才把各版本缺失的新增默认词追加一次（保留原词与原顺序）；
+     * 全新安装直接使用扩展后的 DEFAULT_SKIP。用户后续主动删除这些词，因迁移版本已记录，
+     * 不会被再次加回。v1 补 淘特/快手/微博，v2 补 每拉/天猫积分/积分换能量。
+     */
+    private static synchronized void ensureMigration(Context context) {
+        SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        int done = sp.getInt(KEY_MIGRATION_VERSION, 0);
+        if (done >= MIGRATION_VERSION) return;
+
+        // 全新安装（从未保存过 skip）：直接用扩展后的 DEFAULT_SKIP，无需追加。
+        if (!sp.contains(KEY_SKIP)) {
+            sp.edit().putInt(KEY_MIGRATION_VERSION, MIGRATION_VERSION).apply();
+            return;
+        }
+
+        String existing = sp.getString(KEY_SKIP, "");
+        List<String> current = parseLines(existing);
+        List<String> toAdd = new ArrayList<>();
+        if (done < 1) toAdd.addAll(missingWords(MIGRATION_ADDITIONS_V1, current));
+        if (done < 2) toAdd.addAll(missingWords(MIGRATION_ADDITIONS_V2, current));
+
+        if (!toAdd.isEmpty()) {
+            StringBuilder sb = new StringBuilder(existing.trim());
+            for (String w : toAdd) {
+                if (sb.length() > 0) sb.append('\n');
+                sb.append(w);
+            }
+            sp.edit().putString(KEY_SKIP, sb.toString())
+                    .putInt(KEY_MIGRATION_VERSION, MIGRATION_VERSION).apply();
+            AppState.log("BLACKLIST_MIGRATION v" + MIGRATION_VERSION
+                    + " added=[" + String.join(",", toAdd) + "]");
+        } else {
+            sp.edit().putInt(KEY_MIGRATION_VERSION, MIGRATION_VERSION).apply();
+        }
+    }
+
+    /** 返回 additions 中不在 current（已归一化）里的词，保持 additions 顺序。 */
+    private static List<String> missingWords(List<String> additions, List<String> current) {
+        List<String> out = new ArrayList<>();
+        for (String w : additions) {
+            if (!current.contains(normalizeKeyword(w))) out.add(w);
+        }
+        return out;
     }
 
     private static List<String> parseLines(String raw) {

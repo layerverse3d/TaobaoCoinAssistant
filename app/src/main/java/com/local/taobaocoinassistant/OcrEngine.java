@@ -68,6 +68,13 @@ public final class OcrEngine {
         return captureInternal(190, 70, 190, 960, 1.0f);
     }
 
+    /** 答题页专用 OCR：覆盖几乎整个屏幕（含顶部“淘金币答题”标题与底部“我选好了”），
+     *  识别宽度放宽到约 1080 像素以提高艺术字标题与选项字母的识别率；坐标映射到
+     *  原始屏幕尺寸，避免裁剪后点击错位。 */
+    public Snapshot captureQuizPage() throws Exception {
+        return captureInternal(60, 40, 40, 1080, 1.0f);
+    }
+
     private Snapshot captureInternal(int requestedTopCrop, int requestedBottomCrop, int minRowY,
                                      int maxRecognitionWidth, float maxBottomFraction) throws Exception {
         Bitmap bitmap = takeScreenshotBlocking();

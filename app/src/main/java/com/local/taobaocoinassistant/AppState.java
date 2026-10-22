@@ -38,4 +38,12 @@ public final class AppState {
         }
         return sb.toString();
     }
+
+    /** 清空进程内日志缓冲（不清 running/status/规则/线程），并递增版本以便 UI 立即刷新。 */
+    public static void clearLogs() {
+        synchronized (LOCK) {
+            LOGS.clear();
+            LOG_VERSION++;
+        }
+    }
 }

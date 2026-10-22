@@ -36,6 +36,9 @@ public class AutomationService extends Service {
     private static final String ACTION_START = "com.local.taobaocoinassistant.START";
     private static final String ACTION_STOP = "com.local.taobaocoinassistant.STOP";
     private static final String ACTION_SYNC_OVERLAY = "com.local.taobaocoinassistant.SYNC_OVERLAY";
+    private static final String EXTRA_MODE = "com.local.taobaocoinassistant.EXTRA_MODE";
+    private static final String ACTION_RESTART_FROM_CURRENT = "com.local.taobaocoinassistant.RESTART_FROM_CURRENT";
+    private static final String LAST_MODE_KEY = "last_task_mode";
     private static final int FOREGROUND_ID = 2001;
     private static final String FOREGROUND_CHANNEL = "coin_automation";
 
@@ -52,6 +55,7 @@ public class AutomationService extends Service {
     private final Map<String, Integer> attempted = new HashMap<>();
     private volatile boolean stopRequested = false;
     private volatile boolean automationJobActive = false;
+    private volatile TaskMode currentMode = TaskMode.COIN;
     private OcrEngine ocr;
     private int executedCount = 0;
     private int noChangeScrollCount = 0;
@@ -64,6 +68,11 @@ public class AutomationService extends Service {
     private boolean coinHomeGeometryFallbackUsed = false;
     // v1.1: generic modal/ad obstruction recovery. Back is safer than tapping an unknown X.
     private int popupDismissCount = 0;
+    // 能量模式：已成功认证“做任务赚能量”任务面板。用于面板滚动后顶部标题/累计奖励
+    // 离开 OCR 视口时，仍能结合「进度 + 动作按钮」同行证据确认仍处于任务列表上下文。
+    private volatile boolean energyPanelConfirmed = false;
+    // 本轮已对“看…得能量”促销覆盖层执行的动作次数（BACK/安全X），上限 3 次，防止连续乱按。
+    private int promoOverlayActions = 0;
 
     // 当新版 UC WebView 不暴露 EditText 时，Android shell 的 `input text` 对中文并不可靠。
     // 因此 OCR+Shizuku 兜底使用纯 ASCII 搜索词；只用于完成“搜一搜”任务，不改变任务筛选规则。
@@ -71,13 +80,22 @@ public class AutomationService extends Service {
             "iphone", "macbook", "xiaomi", "camera", "milk"
     );
 
+    // “看…得能量”促销覆盖层标题锚（看抵扣快闪得能量 / 看宠物好货得能量 等变体）。
+    private static final Pattern PROMO_OVERLAY_TITLE = Pattern.compile("看.{1,10}得能量");
+
     public static boolean isServiceActive() {
         AutomationService s = INSTANCE;
         return s != null;
     }
 
-    public static void start(Context context) {
+    /** 统一日志前缀：所有关键阶段自动带 [金币]/[能量]，便于区分当前运行模式。 */
+    private void logMode(String text) {
+        AppState.log("[" + currentMode.label + "] " + text);
+    }
+
+    public static void start(Context context, TaskMode mode) {
         Intent i = new Intent(context, AutomationService.class).setAction(ACTION_START);
+        i.putExtra(EXTRA_MODE, mode == null ? TaskMode.COIN.name() : mode.name());
         if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i);
         else context.startService(i);
     }
@@ -105,12 +123,21 @@ public class AutomationService extends Service {
         else context.startService(i);
     }
 
+    /** 悬浮窗“重新开始”入口：由服务串行调度，上一轮完全结束后才原地恢复。 */
+    public static void requestRestartFromCurrent(Context context) {
+        Intent i = new Intent(context, AutomationService.class).setAction(ACTION_RESTART_FROM_CURRENT);
+        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i);
+        else context.startService(i);
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
         INSTANCE = this;
         if (ocr == null) ocr = new OcrEngine();
-        if (statusOverlay == null) statusOverlay = new StatusOverlay(this, this::stopAutomation);
+        if (statusOverlay == null) {
+            statusOverlay = new StatusOverlay(this, this::stopAutomation, this::beginRestartFromCurrent);
+        }
         Notification foreground = buildForegroundNotification();
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(FOREGROUND_ID, foreground, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
@@ -119,7 +146,7 @@ public class AutomationService extends Service {
         }
         mainHandler.removeCallbacks(overlayTicker);
         mainHandler.post(overlayTicker);
-        AppState.log("纯 Shizuku + OCR 自动化服务已启动（不使用无障碍）");
+        logMode("纯 Shizuku + OCR 自动化服务已启动（不使用无障碍）");
     }
 
     @Override
@@ -128,7 +155,10 @@ public class AutomationService extends Service {
         if (ACTION_STOP.equals(action)) {
             stopAutomation();
         } else if (ACTION_START.equals(action)) {
-            startAutomation();
+            String modeName = intent == null ? null : intent.getStringExtra(EXTRA_MODE);
+            startAutomation(TaskMode.fromName(modeName));
+        } else if (ACTION_RESTART_FROM_CURRENT.equals(action)) {
+            beginRestartFromCurrent();
         } else {
             syncOverlay();
         }
@@ -204,11 +234,39 @@ public class AutomationService extends Service {
         });
     }
 
-    private synchronized void startAutomation() {
+    private synchronized void startAutomation(TaskMode mode) {
+        beginRun(mode, false);
+    }
+
+    /** 悬浮窗“重新开始”：沿用上一次显式选择的模式，从当前页面原地恢复（不重启淘宝）。 */
+    private synchronized void beginRestartFromCurrent() {
+        beginRun(loadLastMode(), true);
+    }
+
+    private void saveLastMode(TaskMode mode) {
+        getSharedPreferences("ui_settings_v1", Context.MODE_PRIVATE)
+                .edit().putString(LAST_MODE_KEY, mode.name()).apply();
+    }
+
+    private TaskMode loadLastMode() {
+        String name = getSharedPreferences("ui_settings_v1", Context.MODE_PRIVATE)
+                .getString(LAST_MODE_KEY, null);
+        return TaskMode.fromName(name);
+    }
+
+    /**
+     * 唯一的运行入口：同一时刻只允许一个自动化作业（单线程 worker + automationJobActive）。
+     * resumeFromCurrent=true 时走原地恢复，不 force-stop 淘宝。
+     */
+    private synchronized void beginRun(TaskMode mode, boolean resumeFromCurrent) {
         if (automationJobActive || AppState.running) {
-            AppState.log("上一轮任务仍在收尾，请稍后再开始");
+            logMode("上一轮任务仍在运行/收尾，暂不能开始");
             return;
         }
+        currentMode = (mode == null ? TaskMode.COIN : mode);
+        saveLastMode(currentMode);
+        energyPanelConfirmed = false;
+        promoOverlayActions = 0;
         automationJobActive = true;
         stopRequested = false;
         attempted.clear();
@@ -218,49 +276,124 @@ public class AutomationService extends Service {
         finalTopRecheckRounds = 0;
         popupDismissCount = 0;
         taskRules = TaskRuleStore.load(this);
-        AppState.log("━━━━━━━━━━ 新一轮执行 ━━━━━━━━━━");
-        AppState.log("任务规则已加载：" + taskRules.summary());
+        logMode("━━━━━━━━━━ " + (resumeFromCurrent ? "原地重新开始" : "新一轮执行") + " ━━━━━━━━━━");
+        logMode("任务规则已加载：" + taskRules.summary());
         AppState.running = true;
         AppState.status = "正在启动";
         refreshForegroundNotification();
-        worker.execute(this::runAutomation);
+        worker.execute(() -> runAutomationInternal(resumeFromCurrent));
     }
 
     private void stopAutomation() {
         stopRequested = true;
-        AppState.running = false;
-        AppState.status = "已停止";
-        AppState.log("收到停止请求");
+        // 保持 running=true 直到 worker 真正退出（finally），期间悬浮窗仍显示“停止”，
+        // 状态显示“正在收尾”，避免用户误以为已停止而重复操作。
+        AppState.status = "正在收尾";
+        logMode("收到停止请求，正在收尾…");
         refreshForegroundNotification();
     }
 
-    private void runAutomation() {
-        NotificationHelper.notify(this, "淘金币助手", "任务开始执行", 1001);
-        AppState.log("开始执行：单线程状态机，不启用后台自动点击");
+    private void runAutomationInternal(boolean resumeFromCurrent) {
+        NotificationHelper.notify(this, "淘金币助手",
+                currentMode.label + (resumeFromCurrent ? "原地重新开始" : "任务开始执行"), 1001);
+        logMode(resumeFromCurrent
+                ? "原地重新开始：从当前页面恢复，不重启淘宝"
+                : "开始执行：单线程状态机，不启用后台自动点击");
         try {
             if (!ShizukuShell.hasPermission()) {
                 throw new IllegalStateException("Shizuku 未连接或未授权");
             }
-            if (!enterTaskList(true)) {
-                throw new IllegalStateException("无法进入淘金币任务列表");
+            boolean entered = resumeFromCurrent
+                    ? resumeFromCurrentPage(currentMode)
+                    : enterTaskList(true, currentMode);
+            if (!entered) {
+                if (stopRequested) {
+                    AppState.status = "已停止";
+                    logMode("用户已停止执行，正常退出");
+                    return;
+                }
+                throw new IllegalStateException(resumeFromCurrent
+                        ? "原地恢复失败：无法确认当前页面属于" + currentMode.label + "任务流程"
+                        : "无法进入" + currentMode.label + "任务列表");
             }
             AppState.status = "识别任务中";
             mainLoop();
-            if (!stopRequested) {
+            if (stopRequested) {
+                AppState.status = "已停止";
+                logMode("用户已停止执行，正常退出");
+            } else {
                 AppState.status = "已完成";
-                AppState.log("本次结束，共发起执行 " + executedCount + " 次任务");
-                NotificationHelper.notify(this, "淘金币助手", "任务执行结束，共发起 " + executedCount + " 次", 1002);
+                logMode("本次结束，共发起执行 " + executedCount + " 次任务");
+                NotificationHelper.notify(this, "淘金币助手", currentMode.label + "任务执行结束，共发起 " + executedCount + " 次", 1002);
             }
         } catch (Throwable e) {
-            AppState.status = "异常结束";
-            AppState.log("异常: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            NotificationHelper.notify(this, "淘金币助手", "任务异常结束，请查看日志", 1003);
+            if (stopRequested) {
+                AppState.status = "已停止";
+                logMode("用户已停止执行，正常退出");
+            } else {
+                AppState.status = "异常结束";
+                logMode("异常: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                NotificationHelper.notify(this, "淘金币助手", currentMode.label + "任务异常结束，请查看日志", 1003);
+            }
         } finally {
             AppState.running = false;
             automationJobActive = false;
             refreshForegroundNotification();
             if (!OverlaySettings.isEnabled(this)) mainHandler.post(this::stopSelf);
         }
+    }
+
+    /** 仅用于原地恢复：面板滚动后标题滚出视口时，凭多条任务行 + 多个动作按钮认定能量列表。 */
+    private boolean isResumableEnergyList(OcrEngine.Snapshot snap) {
+        if (currentMode != TaskMode.DOUBLE11_ENERGY || snap == null) return false;
+        List<TaskParser.TaskItem> tasks = TaskParser.parseEnergyActionable(snap.rows, snap.height);
+        return !tasks.isEmpty() && TaskParser.countActionRows(snap.rows) >= 2;
+    }
+
+    /**
+     * 原地恢复（悬浮窗“重新开始”）：绝不 force-stop 淘宝、不走完整首页重建。
+     * 顺序：任务面板 → 阻塞弹窗处理 → 赛车首页开面板 → 子页面有限 Back；
+     * 证据不足时明确失败并提示用户手动返回，不瞎点。
+     */
+    private boolean resumeFromCurrentPage(TaskMode mode) throws Exception {
+        ForegroundState fg = currentForeground();
+        if (!fg.valid() || !fg.isPackage(TB)) {
+            logMode("原地恢复：当前不在淘宝前台（" + fg + "），请手动返回活动页后再试");
+            return false;
+        }
+
+        for (int round = 0; round < 5 && !stopRequested; round++) {
+            OcrEngine.Snapshot snap = ocr.captureTaskList();
+
+            if (isTaskContextForMode(snap) || isResumableEnergyList(snap)) {
+                if (mode == TaskMode.DOUBLE11_ENERGY) energyPanelConfirmed = true;
+                logMode("原地恢复：已确认" + mode.label + "任务面板，直接进入主循环");
+                return true;
+            }
+
+            if (dismissBlockingPopupIfPresent(snap, "原地恢复")) {
+                sleep(900);
+                continue;
+            }
+
+            if (looksLikeCoinHomeSnapshot(snap)) {
+                logMode("原地恢复：当前在淘金币赛车首页，打开" + mode.label + "任务面板");
+                boolean ok = openPanelForMode(mode) && isModeTaskListVisible(mode);
+                if (ok && mode == TaskMode.DOUBLE11_ENERGY) energyPanelConfirmed = true;
+                return ok;
+            }
+
+            logMode("原地恢复：当前页面暂未识别（第 " + (round + 1) + "/5 轮），尝试有限返回");
+            shellBack();
+            sleep(1000);
+            ForegroundState now = currentForeground();
+            if (!now.isPackage(TB)) {
+                logMode("原地恢复：返回后已离开淘宝，请手动返回活动页后再试");
+                return false;
+            }
+        }
+        logMode("原地恢复未能回到" + mode.label + "任务面板；请手动返回活动页，或从 App 主界面完整启动");
+        return false;
     }
 
     private void mainLoop() throws Exception {
@@ -271,8 +404,8 @@ public class AutomationService extends Service {
 
             ForegroundState fg = currentForeground();
             if (!fg.isPackage(TB)) {
-                AppState.log("主循环检测到已离开淘宝: " + fg + "，执行保险恢复");
-                if (!enterTaskList(true)) throw new IllegalStateException("恢复任务列表失败");
+                logMode("主循环检测到已离开淘宝: " + fg + "，执行保险恢复");
+                if (!enterTaskList(true, currentMode)) throw new IllegalStateException("恢复任务列表失败");
                 noChangeScrollCount = 0;
                 scrollCount = 0;
                 emptyCount = 0;
@@ -286,25 +419,25 @@ public class AutomationService extends Service {
             }
             String all = snap.allText();
             if (containsVerification(all)) {
-                AppState.log("检测到淘宝安全验证，本次停止；请手动处理，不自动绕过验证");
+                logMode("检测到淘宝安全验证，本次停止；请手动处理，不自动绕过验证");
                 stopRequested = true;
                 return;
             }
 
-            // 先强认证“这真的是淘金币任务列表”，再允许解析/点击。
+            // 先强认证“这真的是当前模式的任务面板”，再允许解析/点击。
             // 单独看到一个 (1/3) 之类进度绝不能作为任务页证据，否则商品活动日期会被误当任务。
-            if (!TaskParser.isTrustedTaskContext(snap.rows, snap.height)) {
-                AppState.log("淘宝前台但当前画面不具备可信任务列表特征；禁止解析/点击，先等待一帧复核");
+            if (!isTaskContextForMode(snap)) {
+                logMode("淘宝前台但当前画面不具备可信任务面板特征；禁止解析/点击，先等待一帧复核");
                 sleep(900);
                 OcrEngine.Snapshot contextRetry = ocr.captureTaskList();
-                if (!TaskParser.isTrustedTaskContext(contextRetry.rows, contextRetry.height)) {
-                    AppState.log("连续两帧未通过任务页认证，执行返回/完整恢复，避免把商品页当任务页");
-                    returnToTaskList();
+                if (!isTaskContextForMode(contextRetry)) {
+                    logMode("连续两帧未通过任务页认证，执行返回/完整恢复，避免把商品页当任务页");
+                    returnToTaskList(currentMode);
                     if (stopRequested) return;
                     OcrEngine.Snapshot recovered = ocr.captureTaskList();
-                    if (!TaskParser.isTrustedTaskContext(recovered.rows, recovered.height)) {
-                        AppState.log("常规返回后仍不是可信任务列表，强制重建淘金币任务页");
-                        if (!enterTaskList(true)) throw new IllegalStateException("任务页上下文恢复失败");
+                    if (!isTaskContextForMode(recovered)) {
+                        logMode("常规返回后仍不是可信任务面板，强制重建任务页");
+                        if (!enterTaskList(true, currentMode)) throw new IllegalStateException("任务页上下文恢复失败");
                     }
                     noChangeScrollCount = 0;
                     scrollCount = 0;
@@ -314,28 +447,28 @@ public class AutomationService extends Service {
                 snap = contextRetry;
             }
 
-            List<TaskParser.TaskItem> tasks = TaskParser.parse(snap.rows, snap.height);
-            boolean expandedPanelContext = TaskParser.isExpandedTaskPanelView(snap.rows, snap.height);
+            List<TaskParser.TaskItem> tasks = parseTasksForMode(snap);
+            boolean expandedPanelContext = isExpandedPanelForMode(snap);
             if (tasks.isEmpty() && expandedPanelContext) {
                 emptyCount = 0;
-                AppState.log("已确认今日速赚/专享福利任务面板，但当前视口没有带进度任务；直接进入下滑流程");
+                logMode("已确认任务面板，但当前视口没有带进度任务；直接进入下滑流程");
             } else if (tasks.isEmpty()) {
                 emptyCount++;
-                AppState.log("当前 OCR 为 0 个任务 (" + emptyCount + "/3)，只等待重识别");
+                logMode("当前 OCR 为 0 个任务 (" + emptyCount + "/3)，只等待重识别");
                 sleep(1500);
 
                 OcrEngine.Snapshot retrySnap = ocr.captureTaskList();
-                List<TaskParser.TaskItem> retryTasks = TaskParser.parse(retrySnap.rows, retrySnap.height);
+                List<TaskParser.TaskItem> retryTasks = parseTasksForMode(retrySnap);
                 if (!retryTasks.isEmpty()) {
-                    AppState.log("重新识别恢复，当前可见任务 " + retryTasks.size() + " 个");
+                    logMode("重新识别恢复，当前可见任务 " + retryTasks.size() + " 个");
                     emptyCount = 0;
                     continue;
                 }
 
                 ForegroundState retryFg = currentForeground();
                 if (!retryFg.isPackage(TB)) {
-                    AppState.log("OCR 持续为空且已离开淘宝: " + retryFg);
-                    if (!enterTaskList(true)) throw new IllegalStateException("OCR 空白后恢复失败");
+                    logMode("OCR 持续为空且已离开淘宝: " + retryFg);
+                    if (!enterTaskList(true, currentMode)) throw new IllegalStateException("OCR 空白后恢复失败");
                     emptyCount = 0;
                     noChangeScrollCount = 0;
                     scrollCount = 0;
@@ -343,8 +476,8 @@ public class AutomationService extends Service {
                 }
 
                 if (emptyCount >= 3) {
-                    AppState.log("连续 3 次 OCR 为空但仍在淘金币容器，执行完整页面恢复作为保险");
-                    if (!enterTaskList(true)) throw new IllegalStateException("OCR 空白后恢复失败");
+                    logMode("连续 3 次 OCR 为空但仍在淘宝容器，执行完整页面恢复作为保险");
+                    if (!enterTaskList(true, currentMode)) throw new IllegalStateException("OCR 空白后恢复失败");
                     emptyCount = 0;
                     noChangeScrollCount = 0;
                     scrollCount = 0;
@@ -353,21 +486,27 @@ public class AutomationService extends Service {
             }
             emptyCount = 0;
 
-            AppState.log("当前屏幕识别到 " + tasks.size() + " 个任务");
+            logMode("当前屏幕识别到 " + tasks.size() + " 个任务");
             List<TaskParser.TaskItem> ordered = new ArrayList<>(tasks);
             ordered.sort(Comparator.comparingInt(TaskParser::priority).thenComparingInt(t -> t.y));
 
             TaskParser.TaskItem chosen = null;
             for (TaskParser.TaskItem t : ordered) {
-                AppState.log("候选: " + t.name);
-                if (TaskParser.skip(t, taskRules)) {
-                    AppState.log("跳过: " + t.name);
+                String rawName = t.name.length() > 40 ? t.name.substring(0, 40) + "…" : t.name;
+                String reason = TaskParser.skipReason(t, taskRules);
+                if (reason != null) {
+                    // 可诊断决策日志：OCR 原名（截断）+ 归一化名 + 命中的具体规则。
+                    logMode("跳过[" + reason + "] raw=" + rawName
+                            + " norm=" + TaskRuleStore.normalizeKeyword(t.name));
                     continue;
                 }
-                if (attempted.getOrDefault(t.name, 0) >= 2) {
-                    AppState.log("已尝试过多次，跳过: " + t.name);
+                if (attempted.getOrDefault(stableTaskId(t), 0) >= 2) {
+                    logMode("跳过[多次尝试未成功(" + attempted.get(stableTaskId(t)) + "次)]: " + rawName
+                            + " norm=" + TaskRuleStore.normalizeKeyword(t.name));
                     continue;
                 }
+                logMode("候选[通过规则，历史尝试" + attempted.getOrDefault(stableTaskId(t), 0)
+                        + "次] raw=" + rawName);
                 chosen = t;
                 break;
             }
@@ -379,9 +518,9 @@ public class AutomationService extends Service {
                 continue;
             }
 
-            if (TaskParser.bottomVisible(snap.rows)) {
-                AppState.log("已到任务列表底部；当前剩余任务均为已完成/黑名单，进入收尾复查/领奖");
-                if (finalRewardSweep()) {
+            if (bottomVisibleForMode(snap)) {
+                logMode("已到任务列表底部；当前剩余任务均为已完成/黑名单，进入收尾复查/领奖");
+                if (finalRewardSweep(currentMode)) {
                     noChangeScrollCount = 0;
                     scrollCount = 0;
                     emptyCount = 0;
@@ -392,7 +531,7 @@ public class AutomationService extends Service {
 
             scrollCount++;
             String before = signature(tasks);
-            AppState.log("当前视口没有可执行任务，使用纯 Shizuku input swipe 向下滚动 (" + scrollCount + "/10)");
+            logMode("当前视口没有可执行任务，使用纯 Shizuku input swipe 向下滚动 (" + scrollCount + "/10)");
             shellSwipeList(snap.width, snap.height);
             sleep(1200);
 
@@ -400,20 +539,20 @@ public class AutomationService extends Service {
             OcrEngine.Snapshot afterSnap = null;
             try {
                 afterSnap = ocr.captureTaskList();
-                afterTasks = TaskParser.parse(afterSnap.rows, afterSnap.height);
+                afterTasks = parseTasksForMode(afterSnap);
                 if (afterTasks.isEmpty()) {
                     sleep(550);
                     afterSnap = ocr.captureTaskList();
-                    afterTasks = TaskParser.parse(afterSnap.rows, afterSnap.height);
+                    afterTasks = parseTasksForMode(afterSnap);
                 }
             } catch (Throwable e) {
-                AppState.log("滚动后 OCR 暂时失败: " + e.getMessage());
+                logMode("滚动后 OCR 暂时失败: " + e.getMessage());
             }
 
             ForegroundState afterFg = currentForeground();
             if (!afterFg.isPackage(TB)) {
-                AppState.log("滑动后检测到已离开淘宝: " + afterFg + "，执行完整任务页恢复");
-                if (!enterTaskList(true)) throw new IllegalStateException("滑动后恢复任务列表失败");
+                logMode("滑动后检测到已离开淘宝: " + afterFg + "，执行完整任务页恢复");
+                if (!enterTaskList(true, currentMode)) throw new IllegalStateException("滑动后恢复任务列表失败");
                 scrollCount = 0;
                 noChangeScrollCount = 0;
                 emptyCount = 0;
@@ -423,36 +562,36 @@ public class AutomationService extends Service {
             // Reuse the same post-swipe OCR frame for context certification; v2.0 used to take
             // an extra full screenshot here, which made every list swipe unnecessarily slow.
             try {
-                if (afterSnap != null && !TaskParser.isTrustedTaskContext(afterSnap.rows, afterSnap.height)) {
-                    AppState.log("滚动后任务页上下文丢失，停止解析并执行恢复");
-                    if (!enterTaskList(true)) throw new IllegalStateException("滚动后任务页上下文恢复失败");
+                if (afterSnap != null && !isTaskContextForMode(afterSnap)) {
+                    logMode("滚动后任务页上下文丢失，停止解析并执行恢复");
+                    if (!enterTaskList(true, currentMode)) throw new IllegalStateException("滚动后任务页上下文恢复失败");
                     scrollCount = 0;
                     noChangeScrollCount = 0;
                     emptyCount = 0;
                     continue;
                 }
             } catch (Throwable e) {
-                AppState.log("滚动后任务页认证暂时失败: " + e.getMessage());
+                logMode("滚动后任务页认证暂时失败: " + e.getMessage());
             }
 
             if (afterTasks.isEmpty()) {
                 // 与最终 Python 版一致：仍在 TMS 容器时，不把一次空 OCR 当成“没有滚动”。
-                AppState.log("滚动后 OCR 暂时为空；不补点击、不后退，下一轮重新确认");
+                logMode("滚动后 OCR 暂时为空；不补点击、不后退，下一轮重新确认");
                 noChangeScrollCount = 0;
             } else {
                 String after = signature(afterTasks);
                 if (after.equals(before)) {
                     noChangeScrollCount++;
-                    AppState.log("滚动后任务未变化 (" + noChangeScrollCount + "/2)");
+                    logMode("滚动后任务未变化 (" + noChangeScrollCount + "/2)");
                 } else {
                     noChangeScrollCount = 0;
-                    AppState.log("滚动后任务已变化");
+                    logMode("滚动后任务已变化");
                 }
             }
 
             if (noChangeScrollCount >= 2) {
-                AppState.log("连续两次滚动后任务内容未变化，判断已到底，进入收尾复查/领奖");
-                if (finalRewardSweep()) {
+                logMode("连续两次滚动后任务内容未变化，判断已到底，进入收尾复查/领奖");
+                if (finalRewardSweep(currentMode)) {
                     noChangeScrollCount = 0;
                     scrollCount = 0;
                     emptyCount = 0;
@@ -461,8 +600,8 @@ public class AutomationService extends Service {
                 return;
             }
             if (scrollCount >= 10) {
-                AppState.log("连续多次滚动后仍未找到可执行任务，进入收尾复查/领奖");
-                if (finalRewardSweep()) {
+                logMode("连续多次滚动后仍未找到可执行任务，进入收尾复查/领奖");
+                if (finalRewardSweep(currentMode)) {
                     noChangeScrollCount = 0;
                     scrollCount = 0;
                     emptyCount = 0;
@@ -473,44 +612,163 @@ public class AutomationService extends Service {
         }
     }
 
+    /** 按当前模式选择任务解析策略：能量模式必须使用带动作按钮证据的严格解析。 */
+    private List<TaskParser.TaskItem> parseTasksForMode(OcrEngine.Snapshot snap) {
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            return TaskParser.parseEnergyActionable(snap.rows, snap.height);
+        }
+        return TaskParser.parse(snap.rows, snap.height);
+    }
+
+    /**
+     * 按当前模式认证“当前画面确实是本模式的任务面板”。
+     * 能量模式额外支持“有状态的已进入任务列表”上下文（标题滚出视口后仍可认证）。
+     */
+    private boolean isTaskContextForMode(OcrEngine.Snapshot snap) {
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
+        }
+        return TaskParser.isTrustedTaskContext(snap.rows, snap.height);
+    }
+
+    /** 按当前模式判断“已进入可执行任务面板（即使当前视口暂无带进度任务）”。 */
+    private boolean isExpandedPanelForMode(OcrEngine.Snapshot snap) {
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
+        }
+        return TaskParser.isExpandedTaskPanelView(snap.rows, snap.height);
+    }
+
+    /** 按当前模式判断是否已滚动到任务列表底部。 */
+    private boolean bottomVisibleForMode(OcrEngine.Snapshot snap) {
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            return TaskParser.energyBottomVisible(snap.rows);
+        }
+        return TaskParser.bottomVisible(snap.rows);
+    }
+
+    /**
+     * 能量模式“已进入可信任务列表”的有状态上下文判断。
+     *
+     * <p>面板已确认打开并滚动后，顶部“做任务赚能量”标题/“累计任务奖励”可能离开 OCR
+     * 视口；不能单靠标题不见了就判定失败。此方法仅在本次运行已成功认证过能量面板
+     * （energyPanelConfirmed）的前提下，结合当前可见的多条「进度 + 任务动作按钮」同行
+     * 证据与前台包名判断仍处于列表。绝不因任意 0/1 或单个“能量”字样通过。</p>
+     */
+    private boolean isEnergyTaskListContext(OcrEngine.Snapshot snap) {
+        if (snap == null || !energyPanelConfirmed) return false;
+        if (!TB.equals(currentPackage())) return false;
+        List<TaskParser.TaskItem> tasks = TaskParser.parseEnergyActionable(snap.rows, snap.height);
+        int actionRows = TaskParser.countActionRows(snap.rows);
+        return !tasks.isEmpty() && actionRows >= 2;
+    }
+
+    /**
+     * 稳定任务身份，用于 attempted 重试计数。默认返回任务名（含进度，进度增长即新身份，
+     * 保证 (0/5)→(1/5) 可继续执行）。对“淘金币省钱等级考试”这类 OCR 易抖动的任务
+     * （“等级”→“等圾”）返回确定性身份，避免同一题因文字抖动被当作新任务反复执行。
+     */
+    private String stableTaskId(TaskParser.TaskItem t) {
+        if (isCoinExamTask(t.name)) return "exam:coin_saving_exam";
+        return t.name;
+    }
+
+    /** 受限匹配“淘金币省钱等级考试”及其 OCR 变体（等级/等圾/等級、省钱/省线、钱/錢/线/線）。 */
+    private boolean isCoinExamTask(String name) {
+        String norm = TaskRuleStore.normalizeKeyword(name);
+        if (!norm.contains("考试")) return false;
+        // 局部繁体/形近归一，覆盖 等級/省线/錢 等 OCR 抖动。
+        String n = norm.replace('級', '级').replace('錢', '钱').replace('線', '线');
+        if (n.contains("省钱") || n.contains("省线")) return true;
+        return n.contains("等级") || n.contains("等圾");
+    }
+
+    /** 来源任务是否为考试类（标题含“考试”二字），用于限定宽松答题认证路径。 */
+    private boolean isExamLikeTask(String name) {
+        return name != null && TaskRuleStore.normalizeKeyword(name).contains("考试");
+    }
+
     private void executeTask(TaskParser.TaskItem task, int width, int height) throws Exception {
-        attempted.put(task.name, attempted.getOrDefault(task.name, 0) + 1);
+        attempted.put(stableTaskId(task), attempted.getOrDefault(stableTaskId(task), 0) + 1);
         executedCount++;
         AppState.status = "执行: " + task.name;
         boolean externalTask = TaskParser.external(task, taskRules);
         boolean searchTask = TaskParser.isSearch(task, taskRules);
-        AppState.log("准备执行任务[" + TaskParser.displayMode(task, taskRules) + "]: " + task.name);
+        // 能量模式受限搜索候选：OCR 截断的“你喜欢的宝贝(0/5)”仍应按搜索流程执行。
+        boolean energySearchCandidate = currentMode == TaskMode.DOUBLE11_ENERGY
+                && TaskParser.isEnergySearchCandidate(task);
+        if (energySearchCandidate && !searchTask) {
+            logMode("SEARCH_CLASSIFY raw=" + task.name
+                    + " reason=energy_title_variant confidence=candidate");
+        }
+        searchTask = searchTask || energySearchCandidate;
+        logMode("准备执行任务[" + TaskParser.displayMode(task, taskRules) + "]: " + task.name);
 
         int x = (int) (width * 0.875f);
         shellTap(x, task.y);
         sleep(3500);
         if (stopRequested) return;
 
-        if (searchTask) {
-            boolean submitted = handleSearchTask();
+        // 答题页双层认证分流：黑名单已在候选循环 skip（如用户加了“考试”等词会被拦）。
+        // 考试来源任务即使未识别出答题页，也绝不回退为 22 秒普通浏览。
+        boolean sourceExam = isExamLikeTask(task.name);
+        QuizPageInfo quiz = detectQuizPageWithRetry(task, sourceExam ? 3 : 2);
+        if (quiz != null) {
+            logMode("分类：" + task.name + " -> QUIZ（黑名单未命中，method=" + quiz.method + "）");
+            handleQuizTask(quiz);
             if (stopRequested) return;
-            if (!submitted) {
-                // 搜索页没有真正提交关键词时，不要在入口页机械滑动 22 秒。
-                AppState.log("搜索任务未能提交搜索；直接返回任务列表，不在搜索入口页空滑");
-                returnToTaskList();
+            returnToTaskList(currentMode);
+            if (!stopRequested) AppState.status = "识别任务中";
+            return;
+        }
+        if (sourceExam) {
+            logMode("QUIZ_UNRECOGNISED source=" + task.name
+                    + "（考试任务未识别出答题页，不执行 22 秒浏览，安全返回任务列表）");
+            returnToTaskList(currentMode);
+            if (!stopRequested) AppState.status = "识别任务中";
+            return;
+        }
+
+        if (searchTask) {
+            SearchResult result = handleSearchTask();
+            if (stopRequested) return;
+            if (result == SearchResult.FAILED) {
+                logMode("搜索任务未能打开结果页；直接返回任务列表，不在搜索入口页空滑");
+                returnToTaskList(currentMode);
                 if (!stopRequested) AppState.status = "识别任务中";
                 return;
             }
+            if (result == SearchResult.HANDLED_AND_BROWSED) {
+                // 发现页已点击推荐并浏览约 8 秒，不再额外 22 秒浏览，逐层返回任务列表。
+                logMode("搜索发现页已浏览完成，不额外等待，逐层返回任务列表");
+                returnToTaskList(currentMode);
+                if (!stopRequested) AppState.status = "识别任务中";
+                return;
+            }
+            // SUBMITTED_NEEDS_BROWSE：输入关键词已提交，继续外层 22 秒浏览。
         }
 
         if (stopRequested) return;
         browseCurrentTask(width, height, externalTask);
         if (stopRequested) return;
-        returnToTaskList();
+        returnToTaskList(currentMode);
         if (!stopRequested) AppState.status = "识别任务中";
     }
 
     private void browseCurrentTask(int width, int height, boolean external) throws Exception {
-        final long durationMs = 22_000L;
+        // 金币/能量普通浏览保持原有约 22 秒（覆盖 5s/15s 任务），不做回归性改动。
+        browseFor(width, height, 22_000L, external);
+    }
+
+    /** 通用浏览滑动；时长可调（普通浏览 22 秒，搜索发现中间页流程约 8 秒）。 */
+    private void browseFor(int width, int height, long durationMs, boolean external) throws Exception {
         final long startedAt = SystemClock.elapsedRealtime();
         long lastDialogCheckAt = 0L;
 
-        AppState.log(external ? "跨应用任务：等待约 22 秒，不在外部 App 内主动滑动" : "普通浏览任务：按最终脚本逻辑浏览约 22 秒");
+        logMode(external ? "跨应用任务：等待约 " + (durationMs / 1000) + " 秒，不在外部 App 内主动滑动"
+                : "浏览任务：按脚本逻辑浏览约 " + (durationMs / 1000) + " 秒");
 
         while (!stopRequested && SystemClock.elapsedRealtime() - startedAt < durationMs) {
             // 纯 OCR 模式：每隔约 3 秒检查一次“浏览器打开”系统弹窗。
@@ -540,7 +798,7 @@ public class AutomationService extends Service {
             ShizukuShell.Result r = ShizukuShell.exec(
                     "input swipe " + startX + " " + startY + " " + endX + " " + endY + " " + duration
             );
-            if (!r.ok()) AppState.log("浏览滑动失败: " + r.output);
+            if (!r.ok()) logMode("浏览滑动失败: " + r.output);
             sleep(800 + random.nextInt(1201));
         }
     }
@@ -552,34 +810,172 @@ public class AutomationService extends Service {
         return lo + random.nextInt(hi - lo + 1);
     }
 
+    /** 是否为“历史搜索/搜索发现”搜索中间页（双11搜索任务的必经中间页）。 */
+    private boolean isSearchDiscoveryPage(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        String all = normalizeOcr(snap.allText());
+        return all.contains("搜索发现") || all.contains("历史搜索");
+    }
+
+    private boolean isUnsafeSearchDiscoveryText(String t) {
+        String[] unsafe = {"删除", "清空", "反馈", "客服", "购物车", "结算", "支付",
+                "收藏", "加购", "下单", "搜索发现", "历史搜索"};
+        for (String w : unsafe) {
+            if (t.contains(w)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 在搜索发现区定位一个安全的推荐项。优先元素级目标——两列卡片会被行级 OCR
+     * 合并成一行，点 union 中心会落在两卡之间的空隙。排除 清空/删除/反馈/支付 等
+     * 危险词与“搜索发现/历史搜索”标题锚本身；绝不点垃圾桶/清空历史。
+     */
+    private int[] findSearchDiscoveryTarget(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        int anchorBottom = -1;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            if (normalizeOcr(row.text).contains("搜索发现")) {
+                anchorBottom = row.bounds.bottom;
+                break;
+            }
+        }
+        if (anchorBottom < 0) {
+            for (OcrEngine.OcrRow row : snap.rows) {
+                if (normalizeOcr(row.text).contains("历史搜索")) {
+                    anchorBottom = row.bounds.bottom;
+                    break;
+                }
+            }
+        }
+        if (anchorBottom < 0) return null;
+        int minY = anchorBottom + 8;
+        int maxY = (int) (snap.height * 0.92f);
+
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                int cy = e.bounds.centerY();
+                if (cy < minY || cy > maxY) continue;
+                String t = normalizeOcr(e.text);
+                if (t.length() < 2 || t.length() > 20) continue;
+                if (isUnsafeSearchDiscoveryText(t)) continue;
+                return new int[]{e.bounds.centerX(), cy};
+            }
+        }
+        for (OcrEngine.OcrRow row : snap.rows) {
+            int cy = row.bounds.centerY();
+            if (cy < minY || cy > maxY) continue;
+            String t = normalizeOcr(row.text);
+            if (t.length() < 2 || t.length() > 20) continue;
+            if (isUnsafeSearchDiscoveryText(t)) continue;
+            return new int[]{Math.max(24, Math.min(snap.width - 24, row.bounds.centerX())), cy};
+        }
+        return null;
+    }
+
+    /**
+     * 能量搜索任务专用：识别“历史搜索/搜索发现”中间页，点击安全推荐项并验证页面
+     * 切换，随后浏览约 8 秒（5 秒任务 + 缓冲）。返回 Boolean.TRUE/FALSE 表示已按
+     * 该页面处理（成功/失败）；null 表示页面类型不匹配或无法安全定位，调用方回退
+     * 到原有输入关键词流程。返回任务面板/进度复查由 executeTask 的
+     * returnToTaskList 与主循环完成。
+     */
+    private Boolean tryHandleSearchDiscoveryPage() throws Exception {
+        for (int i = 1; i <= 3 && !stopRequested; i++) {
+            OcrEngine.Snapshot snap;
+            try {
+                snap = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("搜索中间页 OCR 失败: " + e.getMessage());
+                sleep(700);
+                continue;
+            }
+            if (!isSearchDiscoveryPage(snap)) {
+                if (i >= 2) return null;   // 连续两帧都不是中间页，交给原流程
+                sleep(800);
+                continue;
+            }
+
+            String act = currentForeground().activityName;
+            if (act != null && act.contains(".")) act = act.substring(act.lastIndexOf('.') + 1);
+            logMode("SEARCH_CONTEXT activity=" + act
+                    + " discovery=true（历史搜索/搜索发现，不触碰清空/删除历史）");
+            int[] target = findSearchDiscoveryTarget(snap);
+            if (target == null) {
+                logMode("搜索发现页未能安全定位推荐项；回退到输入关键词流程");
+                return null;
+            }
+            String before = compactPanelSignature(snap);
+            shellTap(target[0], target[1]);
+            logMode("已点击搜索发现推荐项 (" + target[0] + ", " + target[1] + ")");
+            sleep(2600);
+            if (stopRequested) return false;
+
+            OcrEngine.Snapshot after = null;
+            try {
+                after = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("点击推荐项后 OCR 暂时失败，按已进入浏览页处理: " + e.getMessage());
+            }
+            boolean left = after == null
+                    || (!isSearchDiscoveryPage(after) && !compactPanelSignature(after).equals(before));
+            if (!left) {
+                logMode("点击推荐项后页面未切换，本次按失败记录，返回任务列表复查进度");
+                return false;
+            }
+            logMode("已进入推荐/结果页，开始约 8 秒安全浏览（少量滑动）");
+            browseFor(after == null ? snap.width : after.width,
+                    after == null ? snap.height : after.height, 8_000L, false);
+            return !stopRequested;
+        }
+        return null;
+    }
+
     /**
      * 搜一搜任务：纯 OCR 定位搜索栏，Shizuku 负责聚焦、输入和提交。
      * 不读取 EditText 或 WebView UI tree；搜索页只以截图 OCR 与 Shizuku 输入为准。
      */
-    private boolean handleSearchTask() throws Exception {
+    /** 搜索任务处理结果语义：已浏览 / 需外层继续浏览 / 失败。 */
+    private enum SearchResult {
+        HANDLED_AND_BROWSED,    // 发现页已点击推荐并完成约 8 秒浏览，外层无需再浏览
+        SUBMITTED_NEEDS_BROWSE, // 输入关键词已提交，外层继续 22 秒浏览
+        FAILED                  // 无法认证/打开，安全返回任务列表
+    }
+
+    private SearchResult handleSearchTask() throws Exception {
         AppState.status = "搜索任务：OCR定位搜索框";
+
+        // 能量模式：优先处理“历史搜索/搜索发现”中间页（点推荐项 → 浏览 → 逐步返回）。
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            Boolean discovery = tryHandleSearchDiscoveryPage();
+            if (discovery != null) {
+                return discovery ? SearchResult.HANDLED_AND_BROWSED : SearchResult.FAILED;
+            }
+        }
 
         for (int attempt = 1; attempt <= 8 && !stopRequested; attempt++) {
             try {
                 OcrEngine.Snapshot snap = ocr.captureSearchPage();
                 SearchVisualTarget target = findSearchVisualTarget(snap);
                 if (target != null) {
-                    AppState.log("OCR 已定位新版搜索页，搜索栏 y=" + target.inputY + "，使用 Shizuku 输入");
-                    if (submitSearchByVisualTarget(target)) return true;
-                    if (stopRequested) return false;
+                    logMode("OCR 已定位新版搜索页，搜索栏 y=" + target.inputY + "，使用 Shizuku 输入");
+                    if (submitSearchByVisualTarget(target)) {
+                        return SearchResult.SUBMITTED_NEEDS_BROWSE;
+                    }
+                    if (stopRequested) return SearchResult.FAILED;
                 } else if (attempt == 1 || attempt == 4 || attempt == 8) {
-                    AppState.log("搜索页 OCR 暂未定位输入栏 (" + attempt + "/8): " + summarizeSearchOcr(snap));
+                    logMode("搜索页 OCR 暂未定位输入栏 (" + attempt + "/8): " + summarizeSearchOcr(snap));
                 }
             } catch (Throwable e) {
                 if (attempt == 1 || attempt == 8) {
-                    AppState.log("搜索页 OCR 失败 (" + attempt + "/8): " + e.getMessage());
+                    logMode("搜索页 OCR 失败 (" + attempt + "/8): " + e.getMessage());
                 }
             }
             sleep(650);
         }
 
-        if (!stopRequested) AppState.log("未能通过 OCR 定位/提交新版搜索框");
-        return false;
+        if (!stopRequested) logMode("未能通过 OCR 定位/提交新版搜索框");
+        return SearchResult.FAILED;
     }
 
     private boolean submitSearchByVisualTarget(SearchVisualTarget target) throws Exception {
@@ -595,15 +991,15 @@ public class AutomationService extends Service {
         ShizukuShell.exec("i=0; while [ $i -lt 24 ]; do input keyevent KEYCODE_DEL; i=$((i+1)); done");
         ShizukuShell.Result typed = ShizukuShell.exec("input text " + keyword);
         if (!typed.ok()) {
-            AppState.log("Shizuku 向搜索框输入关键词失败: " + typed.output);
+            logMode("Shizuku 向搜索框输入关键词失败: " + typed.output);
             return false;
         }
-        AppState.log("已用 Shizuku 向 OCR 定位的搜索框输入关键词: " + keyword);
+        logMode("已用 Shizuku 向 OCR 定位的搜索框输入关键词: " + keyword);
 
         sleep(650);
         if (stopRequested) return false;
         shellTap(target.searchX, target.searchY);
-        AppState.log("通过 OCR 几何位置点击右侧“搜索”按钮: (" + target.searchX + ", " + target.searchY + ")");
+        logMode("通过 OCR 几何位置点击右侧“搜索”按钮: (" + target.searchX + ", " + target.searchY + ")");
 
         AppState.status = "搜索任务：已提交 " + keyword;
         sleep(1800);
@@ -613,11 +1009,11 @@ public class AutomationService extends Service {
             OcrEngine.Snapshot verify = ocr.captureSearchPage();
             String verifyText = normalizeOcr(verify.allText());
             if (verifyText.contains("搜索宝贝") && !verifyText.toLowerCase().contains(keyword.toLowerCase())) {
-                AppState.log("点击搜索后仍检测到空白‘搜索宝贝’占位符，判定本次搜索未提交");
+                logMode("点击搜索后仍检测到空白‘搜索宝贝’占位符，判定本次搜索未提交");
                 return false;
             }
         } catch (Throwable e) {
-            AppState.log("搜索提交后的 OCR 确认暂时失败，继续执行: " + e.getMessage());
+            logMode("搜索提交后的 OCR 确认暂时失败，继续执行: " + e.getMessage());
         }
 
         sleep(1200);
@@ -685,60 +1081,283 @@ public class AutomationService extends Service {
         }
     }
 
-    private boolean enterTaskList(boolean cleanStart) throws Exception {
-        AppState.status = "进入淘金币";
+    /** 淘金币答题页识别结果：选项坐标、是否已出反馈、是否出现领奖/返回提示。 */
+    private static final class QuizPageInfo {
+        final Map<String, int[]> options;
+        final boolean feedbackVisible;
+        final boolean rewardVisible;
+        /** 题型标签：单选/多选，空串表示 OCR 未识别出题型词。 */
+        final String choiceType;
+        /** 认证路径：title=严格标题认证，exam_context_structural=考试来源+结构认证。 */
+        final String method;
+
+        QuizPageInfo(Map<String, int[]> options, boolean feedbackVisible, boolean rewardVisible,
+                     String choiceType, String method) {
+            this.options = options;
+            this.feedbackVisible = feedbackVisible;
+            this.rewardVisible = rewardVisible;
+            this.choiceType = choiceType == null ? "" : choiceType;
+            this.method = method == null ? "title" : method;
+        }
+    }
+
+    /** 答题页扫描中间结果，供认证与诊断复用。 */
+    private static final class QuizScan {
+        boolean titleExact;
+        String choiceType = "";
+        Map<String, int[]> options = new HashMap<>();
+        boolean submitVisible;
+        boolean feedbackVisible;
+        boolean rewardVisible;
+        boolean sourceExam;
+    }
+
+    /** 扫描当前截图，收集答题页证据（标题/题型/选项/提交按钮/反馈），不依赖单一标题。 */
+    private QuizScan scanQuizPage(OcrEngine.Snapshot snap, TaskParser.TaskItem sourceTask) {
+        QuizScan scan = new QuizScan();
+        if (snap == null) return scan;
+        String all = normalizeOcr(snap.allText());
+        scan.titleExact = all.contains("淘金币答题") || all.contains("每日答题");
+        scan.choiceType = all.contains("多选题") || all.contains("多选")
+                ? "多选"
+                : (all.contains("单选题") || all.contains("单选") ? "单选" : "");
+        scan.sourceExam = sourceTask != null && isExamLikeTask(sourceTask.name);
+
+        int titleBottom = -1;
+        int submitY = -1;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (titleBottom < 0 && (t.contains("淘金币答题") || t.contains("每日答题"))) {
+                titleBottom = row.bounds.bottom;
+            }
+            if (submitY < 0 && t.contains("我选好了")) {
+                submitY = row.bounds.centerY();
+            }
+        }
+        scan.submitVisible = submitY > 0;
+
+        // 1) 元素级单字母 A/B/C/D（最可靠）
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                String t = normalizeOcr(e.text);
+                if (t.length() != 1 || "ABCD".indexOf(t.charAt(0)) < 0) continue;
+                int cy = e.bounds.centerY();
+                if (titleBottom > 0 && cy < titleBottom) continue;
+                if (submitY > 0 && cy > submitY) continue;
+                scan.options.putIfAbsent(t, new int[]{e.bounds.centerX(), cy});
+            }
+        }
+        // 2) 行级：以 A/B/C/D 开头（如“A1999年”合并文本）。
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (t.isEmpty()) continue;
+            char c = t.charAt(0);
+            if (!(c == 'A' || c == 'B' || c == 'C' || c == 'D')) continue;
+            String letter = String.valueOf(c);
+            if (scan.options.containsKey(letter)) continue;
+            int cy = row.bounds.centerY();
+            if (titleBottom > 0 && cy < titleBottom) continue;
+            if (submitY > 0 && cy > submitY) continue;
+            scan.options.put(letter, new int[]{row.bounds.centerX(), cy});
+        }
+
+        scan.feedbackVisible = all.contains("正确答案") && all.contains("你的答案");
+        scan.rewardVisible = all.contains("已成功领取奖励") || all.contains("回到主页");
+        return scan;
+    }
+
+    /**
+     * 答题页双层认证：
+     * 路径 A（严格）：标题“淘金币答题/每日答题”命中即可进入，沿用原行为。
+     * 路径 B（考试来源限定结构认证）：来源任务含“考试”，且当前页同时出现 A、B 两个
+     *   有效选项 + “我选好了”提交控件（或已出现领奖反馈），即使顶端艺术字标题漏识别
+     *   也进入。仅凭任意 A/B 字母绝不在商品页/搜索页触发；黑名单已在候选循环拦截。
+     */
+    private QuizPageInfo buildQuizPageInfo(OcrEngine.Snapshot snap, TaskParser.TaskItem sourceTask) {
+        QuizScan scan = scanQuizPage(snap, sourceTask);
+        if (scan.titleExact) {
+            return new QuizPageInfo(scan.options, scan.feedbackVisible, scan.rewardVisible,
+                    scan.choiceType, "title");
+        }
+        if (scan.sourceExam) {
+            boolean hasA = scan.options.containsKey("A");
+            boolean hasB = scan.options.containsKey("B");
+            boolean structural = hasA && hasB && scan.submitVisible;
+            boolean feedback = scan.feedbackVisible || scan.rewardVisible;
+            if (structural || (hasA && feedback)) {
+                return new QuizPageInfo(scan.options, scan.feedbackVisible, scan.rewardVisible,
+                        scan.choiceType, "exam_context_structural");
+            }
+        }
+        return null;
+    }
+
+    private QuizPageInfo detectQuizPageWithRetry(TaskParser.TaskItem sourceTask, int maxAttempts) throws Exception {
+        for (int i = 1; i <= maxAttempts && !stopRequested; i++) {
+            OcrEngine.Snapshot snap = null;
+            try {
+                snap = ocr.captureQuizPage();
+            } catch (Throwable e) {
+                logMode("答题页 OCR 失败 (" + i + "/" + maxAttempts + "): " + e.getMessage());
+            }
+            if (snap != null) {
+                QuizPageInfo quiz = buildQuizPageInfo(snap, sourceTask);
+                if (quiz != null) {
+                    logMode("QUIZ_SCAN pass=" + i
+                            + " titleExact=" + quiz.method.equals("title")
+                            + " choiceType=" + (quiz.choiceType.isEmpty() ? "?" : quiz.choiceType)
+                            + " options=[" + joinOptions(quiz.options) + "]"
+                            + " sourceExam=" + (sourceTask != null && isExamLikeTask(sourceTask.name))
+                            + " method=" + quiz.method);
+                    return quiz;
+                }
+                if (i == maxAttempts) {
+                    QuizScan scan = scanQuizPage(snap, sourceTask);
+                    logMode("QUIZ_DETECT_FAILED titleExact=" + scan.titleExact
+                            + " choiceType=" + (scan.choiceType.isEmpty() ? "?" : scan.choiceType)
+                            + " options=[" + joinOptions(scan.options) + "]"
+                            + " submit=" + scan.submitVisible
+                            + " sourceExam=" + scan.sourceExam);
+                }
+            }
+            if (i < maxAttempts) sleep(1000);
+        }
+        return null;
+    }
+
+    /** 选项字母列表转成可读日志（A,B,C）。 */
+    private String joinOptions(Map<String, int[]> options) {
+        StringBuilder sb = new StringBuilder();
+        for (String letter : new String[]{"A", "B", "C", "D"}) {
+            if (options.containsKey(letter)) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(letter);
+            }
+        }
+        return sb.length() == 0 ? "(无)" : sb.toString();
+    }
+
+    /**
+     * 答题专用流程（首版固定选 A，兼容单选/多选、2–4 个选项；多选也只选 A 后提交。
+     * 不联网找答案，只按页面真实反馈决定后续动作，绝不重复作答）。
+     */
+    private void handleQuizTask(QuizPageInfo quiz) throws Exception {
+        logMode("答题页认证 method=" + quiz.method + " 题型="
+                + (quiz.choiceType.isEmpty() ? "未识别" : quiz.choiceType)
+                + " 选项=" + joinOptions(quiz.options));
+
+        if (quiz.rewardVisible) {
+            clickQuizReturnHome();
+            return;
+        }
+
+        int[] optionA = quiz.options.get("A");
+        if (optionA == null) {
+            logMode("答题页缺 A 选项，安全退出该项（不转为浏览），返回任务列表");
+            return;
+        }
+        shellTap(optionA[0], optionA[1]);
+        logMode("QUIZ_TAP option=A (" + optionA[0] + "," + optionA[1] + ")");
+        sleep(1200);
+        if (stopRequested) return;
+
+        OcrEngine.Snapshot afterSelect = ocr.captureQuizPage();
+        int[] submit = findTextPoint(afterSelect, "我选好了", false);
+        if (submit != null) {
+            shellTap(submit[0], submit[1]);
+            logMode("QUIZ_SUBMIT button=我选好了");
+            sleep(2200);
+        } else {
+            logMode("未看到“我选好了”提交按钮，按页面当前状态复查反馈（不无限点击）");
+        }
+        if (stopRequested) return;
+
+        QuizScan feedback = scanQuizPage(ocr.captureQuizPage(), null);
+        if (feedback.rewardVisible) {
+            logMode("QUIZ_RESULT reward=confirmed（已成功领取奖励 / 出现返回提示）");
+            clickQuizReturnHome();
+        } else {
+            logMode("QUIZ_RESULT reward=unconfirmed，安全返回任务列表（不重复作答）");
+        }
+    }
+
+    /** 点击“已成功领取奖励 回到主页”按钮；定位不到时仅记录，不盲点坐标。 */
+    private void clickQuizReturnHome() throws Exception {
+        OcrEngine.Snapshot snap = ocr.captureQuizPage();
+        int[] home = findTextPoint(snap, "回到主页", false);
+        if (home == null) home = findTextPoint(snap, "已成功领取奖励", false);
+        if (home != null) {
+            shellTap(home[0], home[1]);
+            logMode("已点击“回到主页”返回");
+            sleep(2200);
+        } else {
+            logMode("未定位到“回到主页”按钮，交由返回流程恢复任务列表");
+        }
+    }
+
+    private boolean enterTaskList(boolean cleanStart, TaskMode mode) throws Exception {
+        currentMode = mode;
+        AppState.status = "进入" + mode.label;
 
         // 完整恢复流程只在需要时清理并启动一次淘宝。
         // 进入“领淘金币”后不要求 UC WebView 暴露任何 UI 节点，只按真实截图继续
-        // “签到/赚更多金币”的下一阶段，避免明明已到淘金币首页却被误判为失败。
+        // 下一阶段，避免明明已到淘金币首页却被误判为失败。
         if (cleanStart) {
+            energyPanelConfirmed = false;
             ShizukuShell.exec("am force-stop " + TB);
         }
         launchTaobao();
         sleep(2600);
 
         for (int attempt = 1; attempt <= 2 && !stopRequested; attempt++) {
-            AppState.log("进入任务页尝试 " + attempt + "/2");
+            logMode("进入任务页尝试 " + attempt + "/2");
 
             if (!TB.equals(currentPackage())) {
-                AppState.log("当前不在淘宝，重新拉起淘宝，但不重复 force-stop");
+                logMode("当前不在淘宝，重新拉起淘宝，但不重复 force-stop");
                 launchTaobao();
                 sleep(1800);
             } else if (attempt > 1) {
-                AppState.log("继续在当前淘宝页面重试，不重启 App");
+                logMode("继续在当前淘宝页面重试，不重启 App");
                 sleep(900);
             }
 
             // One fast navigation frame handles all three states: already in task panel,
             // already on coin home, or still on Taobao home with the coin entry visible.
+            // 两种模式都先进入“淘金币首页（赛车首页）”，再按模式进入对应任务面板。
             boolean atCoinHome = openCoinHomeFromTaobaoHome();
             if (!atCoinHome) {
-                AppState.log("未能打开淘金币入口");
+                logMode("未能打开淘金币入口");
                 continue;
             }
 
-            // 点击“领淘金币”后，即使下一帧 OCR 暂时没更新，也直接尝试处理中央的
-            // “签到领金币 / 赚更多金币”，不再返回淘宝首页重复导航。
-            AppState.log("已到淘金币页面，直接处理签到/赚更多金币");
-            if (openTaskPanel()) {
-                AppState.log("已进入淘金币任务列表");
-                return true;
+            if (mode == TaskMode.DOUBLE11_ENERGY) {
+                logMode("已到淘金币首页，定位右侧“赚能量”入口");
+                if (openEnergyPanel()) {
+                    logMode("已进入能量任务面板");
+                    return true;
+                }
+            } else {
+                logMode("已到淘金币首页，打开金币任务面板（季节首页优先左侧去赚金币，兼容旧版）");
+                if (openTaskPanel()) {
+                    logMode("已进入淘金币任务列表");
+                    return true;
+                }
             }
 
-            AppState.log("当前淘金币页面暂未打开/确认任务面板；保持当前页面重试，不重启淘宝");
+            logMode("当前页面暂未打开/确认任务面板；保持当前页面重试，不重启淘宝");
         }
         return false;
     }
 
     private boolean openCoinHomeFromTaobaoHome() throws Exception {
-        AppState.log("检查当前页面：快速 OCR 确认是否已在淘金币首页，否则寻找‘领淘金币’入口");
+        logMode("检查当前页面：快速 OCR 确认是否已在淘金币首页，否则寻找‘领淘金币’入口");
 
         for (int i = 1; i <= 3 && !stopRequested; i++) {
             OcrEngine.Snapshot snap;
             try {
                 snap = ocr.captureNavigation();
             } catch (Throwable e) {
-                AppState.log("导航 OCR 失败: " + e.getMessage());
+                logMode("导航 OCR 失败: " + e.getMessage());
                 sleep(500);
                 continue;
             }
@@ -748,12 +1367,12 @@ public class AutomationService extends Service {
                 continue;
             }
 
-            if (taskPanelVisibleInSnapshot(snap)) {
-                AppState.log("OCR 已确认任务弹窗已经打开，不重复走首页导航");
+            if (taskPanelVisibleForMode(snap)) {
+                logMode("OCR 已确认任务弹窗已经打开，不重复走首页导航");
                 return true;
             }
             if (looksLikeCoinHomeSnapshot(snap)) {
-                AppState.log("OCR 已确认当前就在淘金币首页，不重复走首页导航");
+                logMode("OCR 已确认当前就在淘金币首页，不重复走首页导航");
                 return true;
             }
 
@@ -761,7 +1380,7 @@ public class AutomationService extends Service {
             if (p == null) p = findTextPoint(snap, "淘金币", false);
             if (p != null) {
                 shellTap(p[0], p[1]);
-                AppState.log("通过宽范围 OCR 点击淘宝首页淘金币入口: (" + p[0] + ", " + p[1] + ")");
+                logMode("通过宽范围 OCR 点击淘宝首页淘金币入口: (" + p[0] + ", " + p[1] + ")");
 
                 // Do not assume a tap succeeded. Shortcut labels from multiple icons are sometimes
                 // merged into one OCR row; the next frame is the source of truth. If we are still
@@ -772,7 +1391,7 @@ public class AutomationService extends Service {
                 for (int confirm = 1; confirm <= 2 && !stopRequested; confirm++) {
                     try {
                         OcrEngine.Snapshot afterTap = ocr.captureNavigation();
-                        if (taskPanelVisibleInSnapshot(afterTap) || looksLikeCoinHomeSnapshot(afterTap)) {
+                        if (taskPanelVisibleForMode(afterTap) || looksLikeCoinHomeSnapshot(afterTap)) {
                             confirmed = true;
                             break;
                         }
@@ -780,17 +1399,17 @@ public class AutomationService extends Service {
                     if (confirm < 2) sleep(650);
                 }
                 if (confirmed) {
-                    AppState.log("已确认进入淘金币页面");
+                    logMode("已确认进入淘金币页面");
                     return true;
                 }
-                AppState.log("点击淘金币入口后仍未确认进入；重新定位入口，不把淘宝商品首页误当淘金币页");
+                logMode("点击淘金币入口后仍未确认进入；重新定位入口，不把淘宝商品首页误当淘金币页");
                 continue;
             }
-            AppState.log("第 " + i + "/3 次宽范围 OCR 未找到淘金币入口");
+            logMode("第 " + i + "/3 次宽范围 OCR 未找到淘金币入口");
             sleep(500);
         }
 
-        AppState.log("OCR 未找到淘宝首页淘金币入口");
+        logMode("OCR 未找到淘宝首页淘金币入口");
         return false;
     }
 
@@ -798,12 +1417,12 @@ public class AutomationService extends Service {
         Intent launch = getPackageManager().getLaunchIntentForPackage(TB);
         ComponentName component = launch == null ? null : launch.getComponent();
         if (component == null) {
-            AppState.log("无法解析淘宝启动 Activity");
+            logMode("无法解析淘宝启动 Activity");
             return;
         }
         String flat = component.flattenToShortString();
         ShizukuShell.Result r = ShizukuShell.exec("am start -n " + flat + " >/dev/null");
-        if (!r.ok()) AppState.log("Shizuku 拉起淘宝失败: " + r.output);
+        if (!r.ok()) logMode("Shizuku 拉起淘宝失败: " + r.output);
     }
 
     private boolean openTaskPanel() throws Exception {
@@ -815,7 +1434,7 @@ public class AutomationService extends Service {
         try {
             first = ocr.captureNavigation();
         } catch (Throwable e) {
-            AppState.log("淘金币首页快速 OCR 失败: " + e.getMessage());
+            logMode("淘金币首页快速 OCR 失败: " + e.getMessage());
         }
 
         if (first != null && dismissBlockingPopupIfPresent(first, "淘金币首页")) {
@@ -828,14 +1447,21 @@ public class AutomationService extends Service {
         }
 
         if (first != null) {
+            // 新季节双十一赛车首页：左下“去赚金币”优先；旧版中央“赚更多金币”仅作 fallback。
+            // 只有季节首页特征成立才走左侧入口，避免在新首页中央盲点装饰。
+            if (isSeasonalCoinHome(first)) {
+                if (openSeasonalCoinPanel(first)) return true;
+                return false;
+            }
+
             int[] sign = findOcrTextCenter(first, "签到领金币");
             if (sign == null) sign = findOcrTextCenter(first, "签到领淘金币");
             if (sign != null) {
                 lastDailySignX = sign[0];
                 lastDailySignY = sign[1];
                 shellTap(sign[0], sign[1]);
-                AppState.log("通过单帧 OCR 点击每日首次‘签到领金币’");
-                AppState.log("已处理每日首次签到；等待 5 秒让按钮原地切换为‘赚更多金币’");
+                logMode("通过单帧 OCR 点击每日首次‘签到领金币’");
+                logMode("已处理每日首次签到；等待 5 秒让按钮原地切换为‘赚更多金币’");
                 return waitAndOpenMoreAfterDailySign();
             }
 
@@ -845,7 +1471,7 @@ public class AutomationService extends Service {
             if (more != null) {
                 coinHomeGeometryFallbackUsed = true;
                 shellTap(more[0], more[1]);
-                AppState.log("通过单帧快速 OCR/首页特征点击‘赚更多金币’: ("
+                logMode("通过单帧快速 OCR/首页特征点击‘赚更多金币’: ("
                         + more[0] + ", " + more[1] + ")");
                 sleep(1500);
                 if (isTaskPanelVisibleForNavigation()) return ensureTaskListExpanded();
@@ -854,6 +1480,80 @@ public class AutomationService extends Service {
 
         // Only use the slower retry path when the first fast frame was genuinely inconclusive.
         return clickMoreCoinsAndConfirm(3);
+    }
+
+    /** 新季节双十一赛车首页：以左下“去赚金币”强锚（旧版为“赚更多金币”）判定。 */
+    private boolean isSeasonalCoinHome(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        return normalizeOcr(snap.allText()).contains("去赚金币");
+    }
+
+    /**
+     * 新版赛车首页左侧“去赚金币”入口定位：优先元素级，其次行级合并
+     * （如“去赚金币 去赚能量”一行）按子串相对位置定位，且要求落在左侧按钮区；
+     * y 比例仅用于限制候选区域，不做盲点兜底。
+     */
+    private int[] findCoinEntryPoint(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        int minY = (int) (snap.height * 0.35f);
+        int maxY = (int) (snap.height * 0.62f);
+
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                String t = normalizeOcr(e.text);
+                if (!(t.equals("去赚金币") || t.equals("赚金币"))) continue;
+                int cy = e.bounds.centerY();
+                if (cy < minY || cy > maxY) continue;
+                int cx = e.bounds.centerX();
+                if (cx > snap.width * 0.55f) continue;  // 仅左侧按钮区
+                return new int[]{cx, cy};
+            }
+        }
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (!t.contains("去赚金币")) continue;
+            int cy = row.bounds.centerY();
+            if (cy < minY || cy > maxY) continue;
+            int idx = t.indexOf("去赚金币");
+            float charCenter = idx + 2.0f;
+            float ratio = charCenter / Math.max(1f, t.length());
+            int x = row.bounds.left + Math.round(row.bounds.width() * ratio);
+            if (x > snap.width * 0.55f) continue;
+            return new int[]{Math.max(24, Math.min(snap.width - 24, x)), cy};
+        }
+        return null;
+    }
+
+    /** 季节赛车首页：点击左侧“去赚金币”并确认金币任务面板打开，有限次重试。 */
+    private boolean openSeasonalCoinPanel(OcrEngine.Snapshot first) throws Exception {
+        logMode("COIN_HOME_VARIANT=DOUBLE11_RACE evidence=去赚金币");
+        for (int attempt = 1; attempt <= 3 && !stopRequested; attempt++) {
+            OcrEngine.Snapshot snap = (attempt == 1) ? first : ocr.captureNavigation();
+            if (snap == null) {
+                sleep(600);
+                continue;
+            }
+            if (taskPanelVisibleInSnapshot(snap)) {
+                logMode("COIN_PANEL_VERIFY trusted=true（金币任务面板已打开）");
+                return ensureTaskListExpanded();
+            }
+            int[] entry = findCoinEntryPoint(snap);
+            if (entry == null) {
+                logMode("COIN_ENTRY_NOT_FOUND（第 " + attempt + "/3 次未定位到左侧去赚金币）");
+                sleep(600);
+                continue;
+            }
+            shellTap(entry[0], entry[1]);
+            logMode("COIN_ENTRY_TAP left=true (" + entry[0] + "," + entry[1] + ")（第 " + attempt + "/3 次）");
+            sleep(2200);
+            if (isTaskPanelVisibleForNavigation()) {
+                logMode("COIN_PANEL_VERIFY trusted=true（金币任务面板已打开）");
+                return ensureTaskListExpanded();
+            }
+            logMode("COIN_PANEL_UNCONFIRMED（第 " + attempt + "/3 次点击后未确认任务面板）");
+        }
+        logMode("COIN_PANEL_UNCONFIRMED 季节入口多次未确认；OCR 摘要: " + summarizeOcrSnippet(first));
+        return false;
     }
 
     /**
@@ -865,7 +1565,7 @@ public class AutomationService extends Service {
      * 不做 15 秒轮询，也不重启淘宝。
      */
     private boolean waitAndOpenMoreAfterDailySign() throws Exception {
-        AppState.log("签到完成，固定等待 5 秒让按钮切换为‘赚更多金币’");
+        logMode("签到完成，固定等待 5 秒让按钮切换为‘赚更多金币’");
         sleep(5000);
         if (stopRequested) return false;
 
@@ -875,7 +1575,7 @@ public class AutomationService extends Service {
 
         // 第一优先：通过 OCR 找“赚更多金币”。
         if (clickMoreCoinsOnce()) {
-            AppState.log("签到后已点击‘赚更多金币’，等待任务弹窗");
+            logMode("签到后已点击‘赚更多金币’，等待任务弹窗");
             sleep(2500);
             if (isTaskPanelVisibleForNavigation()) {
                 return ensureTaskListExpanded();
@@ -885,7 +1585,7 @@ public class AutomationService extends Service {
         // UC WebView 可能已经换字但 OCR 仍是旧帧。中央按钮位置不变，
         // 因此只在“刚刚明确完成签到”的前提下，使用签到按钮原坐标兜底点击一次。
         if (lastDailySignX > 0 && lastDailySignY > 0) {
-            AppState.log("5 秒后仍未识别到‘赚更多金币’，按签到按钮原位置兜底点击一次");
+            logMode("5 秒后仍未识别到‘赚更多金币’，按签到按钮原位置兜底点击一次");
             shellTap(lastDailySignX, lastDailySignY);
             sleep(2500);
             if (isTaskPanelVisibleForNavigation()) {
@@ -895,14 +1595,14 @@ public class AutomationService extends Service {
 
         // 最后只再做一次正常识别点击，不继续长时间等待。
         if (clickMoreCoinsOnce()) {
-            AppState.log("签到后第二次识别到‘赚更多金币’，已点击");
+            logMode("签到后第二次识别到‘赚更多金币’，已点击");
             sleep(2500);
             if (isTaskPanelVisibleForNavigation()) {
                 return ensureTaskListExpanded();
             }
         }
 
-        AppState.log("签到后 5 秒流程结束，仍未确认任务弹窗；保持当前页面交给外层重试");
+        logMode("签到后 5 秒流程结束，仍未确认任务弹窗；保持当前页面交给外层重试");
         return isTaskPanelVisibleForNavigation() && ensureTaskListExpanded();
     }
 
@@ -917,10 +1617,10 @@ public class AutomationService extends Service {
                 if (isTaskPanelVisibleForNavigation()) {
                     return ensureTaskListExpanded();
                 }
-                AppState.log("已点击‘赚更多金币’，但暂未确认任务弹窗，继续等待 (" + i + "/" + maxAttempts + ")");
+                logMode("已点击‘赚更多金币’，但暂未确认任务弹窗，继续等待 (" + i + "/" + maxAttempts + ")");
                 sleep(450);
             } else {
-                AppState.log("等待‘赚更多金币’入口加载 (" + i + "/" + maxAttempts + ")");
+                logMode("等待‘赚更多金币’入口加载 (" + i + "/" + maxAttempts + ")");
                 sleep(500);
             }
         }
@@ -949,7 +1649,7 @@ public class AutomationService extends Service {
             int[] p = findMoreCoinsVisualPoint(snap);
             if (p != null) {
                 shellTap(p[0], p[1]);
-                AppState.log("通过 OCR 模糊匹配点击淘金币首页“赚更多金币”: (" + p[0] + ", " + p[1] + ")");
+                logMode("通过 OCR 模糊匹配点击淘金币首页“赚更多金币”: (" + p[0] + ", " + p[1] + ")");
                 return true;
             }
 
@@ -959,19 +1659,19 @@ public class AutomationService extends Service {
                 if (fallback != null) {
                     coinHomeGeometryFallbackUsed = true;
                     shellTap(fallback[0], fallback[1]);
-                    AppState.log("OCR 未精确读出“赚更多金币”，但淘金币首页特征分=" + score
+                    logMode("OCR 未精确读出“赚更多金币”，但淘金币首页特征分=" + score
                             + "；按中央大按钮安全位置兜底点击一次: ("
                             + fallback[0] + ", " + fallback[1] + ")");
                     return true;
                 }
             }
         } catch (Throwable e) {
-            AppState.log("赚更多金币 OCR 定位失败: " + e.getMessage());
+            logMode("赚更多金币 OCR 定位失败: " + e.getMessage());
         }
 
         // 识别不到时输出一条精简诊断，下一份日志可以直接看到 ML Kit 实际读到了什么。
         if (snap != null) {
-            AppState.log("未定位到“赚更多金币”；首页 OCR 摘要: " + summarizeCoinHomeOcr(snap));
+            logMode("未定位到“赚更多金币”；首页 OCR 摘要: " + summarizeCoinHomeOcr(snap));
         }
         return false;
     }
@@ -1151,11 +1851,11 @@ public class AutomationService extends Service {
                 lastDailySignX = p[0];
                 lastDailySignY = p[1];
                 shellTap(p[0], p[1]);
-                AppState.log("通过单帧 OCR 点击每日首次‘签到领金币’");
+                logMode("通过单帧 OCR 点击每日首次‘签到领金币’");
                 return true;
             }
         } catch (Throwable e) {
-            AppState.log("签到 OCR 定位失败: " + e.getMessage());
+            logMode("签到 OCR 定位失败: " + e.getMessage());
         }
         return false;
     }
@@ -1194,7 +1894,7 @@ public class AutomationService extends Service {
             try {
                 snap = ocr.captureTaskPanel();
             } catch (Throwable e) {
-                AppState.log("任务面板 OCR 失败: " + e.getMessage());
+                logMode("任务面板 OCR 失败: " + e.getMessage());
                 sleep(420);
                 continue;
             }
@@ -1211,27 +1911,27 @@ public class AutomationService extends Service {
             int[] expand = findExpandTaskPanelPoint(snap);
             if (expand != null) {
                 shellTap(expand[0], expand[1]);
-                AppState.log("检测到‘更多金币等你赚/展开’折叠卡，优先点击展开: ("
+                logMode("检测到‘更多金币等你赚/展开’折叠卡，优先点击展开: ("
                         + expand[0] + ", " + expand[1] + ")");
                 sleep(720);
 
                 OcrEngine.Snapshot after = ocr.captureTaskPanel();
                 int[] stillCollapsed = findExpandTaskPanelPoint(after);
                 if (stillCollapsed == null && TaskParser.isTrustedTaskContext(after.rows, after.height)) {
-                    AppState.log("展开控件已消失，且任务面板认证通过；进入主循环");
+                    logMode("展开控件已消失，且任务面板认证通过；进入主循环");
                     return true;
                 }
                 if (stillCollapsed != null) {
-                    AppState.log("展开控件仍可见，等待 UC WebView 刷新后重试 (" + attempt + "/3)");
+                    logMode("展开控件仍可见，等待 UC WebView 刷新后重试 (" + attempt + "/3)");
                     sleep(420);
                     continue;
                 }
                 if (TaskParser.isTrustedTaskContext(after.rows, after.height)) {
-                    AppState.log("展开后已确认可信任务面板；允许继续识别/下滑");
+                    logMode("展开后已确认可信任务面板；允许继续识别/下滑");
                     return true;
                 }
                 if (taskPanelVisibleInSnapshot(after)) {
-                    AppState.log("展开后任务弹窗仍在，但任务列表特征尚未稳定；等待下一帧 ("
+                    logMode("展开后任务弹窗仍在，但任务列表特征尚未稳定；等待下一帧 ("
                             + attempt + "/3)");
                     sleep(420);
                     continue;
@@ -1240,16 +1940,16 @@ public class AutomationService extends Service {
 
             // 只有确认不存在折叠卡，才允许“可信任务面板”直接进入主循环。
             if (TaskParser.isTrustedTaskContext(snap.rows, snap.height)) {
-                AppState.log("未看到‘更多金币等你赚’折叠卡，任务面板认证通过；可直接识别/下滑");
+                logMode("未看到‘更多金币等你赚’折叠卡，任务面板认证通过；可直接识别/下滑");
                 return true;
             }
 
-            AppState.log("第 " + attempt + "/3 次未确认展开控件或可执行任务列表，短暂等待页面刷新");
+            logMode("第 " + attempt + "/3 次未确认展开控件或可执行任务列表，短暂等待页面刷新");
             sleep(420);
         }
 
         boolean ready = isExpandedTaskListVisible();
-        if (ready) AppState.log("最终确认：任务面板已可执行");
+        if (ready) logMode("最终确认：任务面板已可执行");
         return ready;
     }
 
@@ -1268,23 +1968,23 @@ public class AutomationService extends Service {
         try {
             OcrEngine.Snapshot snap = ocr.captureTaskPanel();
             if (findExpandTaskPanelPoint(snap) != null) {
-                AppState.log("仍看到‘更多金币等你赚/展开’折叠卡，不能把当前画面当作已展开任务列表");
+                logMode("仍看到‘更多金币等你赚/展开’折叠卡，不能把当前画面当作已展开任务列表");
                 return false;
             }
             if (TaskParser.isTrustedTaskContext(snap.rows, snap.height)) {
                 List<TaskParser.TaskItem> tasks = TaskParser.parse(snap.rows, snap.height);
-                AppState.log("OCR 任务上下文认证通过：可见带进度任务 " + tasks.size()
+                logMode("OCR 任务上下文认证通过：可见带进度任务 " + tasks.size()
                         + " 个 / 动作行 " + TaskParser.countActionRows(snap.rows));
                 return true;
             }
         } catch (Throwable e) {
-            AppState.log("任务区域 OCR 强认证失败: " + e.getMessage());
+            logMode("任务区域 OCR 强认证失败: " + e.getMessage());
         }
         return false;
     }
 
-    private void returnToTaskList() throws Exception {
-        AppState.log("开始返回任务列表");
+    private void returnToTaskList(TaskMode mode) throws Exception {
+        logMode("开始返回任务列表");
         long deadline = SystemClock.elapsedRealtime() + 35_000L;
         int backs = 0;
         int foreignBounceCount = 0;
@@ -1300,57 +2000,380 @@ public class AutomationService extends Service {
                 continue;
             }
 
-            AppState.log("返回状态: " + fg);
+            logMode("返回状态: " + fg);
 
-            if (fg.isPackage(TB) && isExpandedTaskListVisible()) {
-                AppState.log("当前已经是任务列表画面，停止继续返回");
+            if (fg.isPackage(TB) && isModeTaskListVisible(mode)) {
+                logMode("当前已经是任务列表画面，停止继续返回");
                 return;
             }
 
             if (!fg.isPackage(TB)) {
                 foreignBounceCount++;
-                AppState.log("当前在其他应用，拉回淘宝: " + fg.packageName
+                logMode("当前在其他应用，拉回淘宝: " + fg.packageName
                         + " (跨应用回跳 " + foreignBounceCount + "/2)");
 
                 // 闲鱼/淘宝广告深链可能形成“闲鱼 -> 淘宝商品 -> back -> 闲鱼”的环。
-                // 第二次回到外部 App 时不再继续猜 Back 栈，直接 force-stop 淘宝并重建淘金币页。
+                // 第二次回到外部 App 时不再继续猜 Back 栈，直接 force-stop 淘宝并重建任务页。
                 if (foreignBounceCount >= 2) {
-                    AppState.log("检测到跨应用深链来回跳转，放弃当前返回栈，强制重建淘金币任务页");
-                    if (!enterTaskList(true)) throw new IllegalStateException("跨应用深链后恢复任务列表失败");
+                    logMode("检测到跨应用深链来回跳转，放弃当前返回栈，强制重建任务页");
+                    if (!enterTaskList(true, mode)) throw new IllegalStateException("跨应用深链后恢复任务列表失败");
                     return;
                 }
 
                 launchTaobao();
                 sleep(2000);
                 if (tapOcrTextContains("跳过", true)) {
-                    AppState.log("通过 OCR 点击淘宝启动页‘跳过’");
+                    logMode("通过 OCR 点击淘宝启动页‘跳过’");
                     sleep(1800);
                 }
                 continue;
             }
 
             if (fg.activityContains("com.taobao.themis.container.app.TMSActivity") && isCoinHomeVisibleForNavigation()) {
-                if (openTaskPanel() && isExpandedTaskListVisible()) {
-                    AppState.log("已重新打开并确认任务列表");
+                if (openPanelForMode(mode) && isModeTaskListVisible(mode)) {
+                    logMode("已重新打开并确认任务列表");
                     return;
                 }
             }
 
             if (fg.activityContains("com.taobao.tao.welcome.Welcome")) {
-                AppState.log("返回到了淘宝首页而不是任务列表，执行完整恢复");
-                if (!enterTaskList(true)) throw new IllegalStateException("返回淘宝首页后恢复失败");
+                logMode("返回到了淘宝首页而不是任务列表，执行完整恢复");
+                if (!enterTaskList(true, mode)) throw new IllegalStateException("返回淘宝首页后恢复失败");
                 return;
             }
 
-            AppState.log("点击系统后退");
+            logMode("点击系统后退");
             shellBack();
             backs++;
             sleep(500);
         }
 
         if (stopRequested) return;
-        AppState.log("常规返回未能恢复任务列表，执行完整恢复");
-        if (!enterTaskList(true)) throw new IllegalStateException("无法恢复任务列表");
+        logMode("常规返回未能恢复任务列表，执行完整恢复");
+        if (!enterTaskList(true, mode)) throw new IllegalStateException("无法恢复任务列表");
+    }
+
+    /** 按模式确认“任务列表可执行”的画面状态。 */
+    private boolean isModeTaskListVisible(TaskMode mode) {
+        if (mode == TaskMode.DOUBLE11_ENERGY) return isEnergyTaskListVisible();
+        return isExpandedTaskListVisible();
+    }
+
+    /** 按模式打开对应任务面板（金币或能量）。 */
+    private boolean openPanelForMode(TaskMode mode) throws Exception {
+        if (mode == TaskMode.DOUBLE11_ENERGY) return openEnergyPanel();
+        return openTaskPanel();
+    }
+
+    /** 按模式判断当前截图是否为本模式的任务面板（用于首页导航短路）。 */
+    private boolean taskPanelVisibleForMode(OcrEngine.Snapshot snap) {
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            return TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
+        }
+        return taskPanelVisibleInSnapshot(snap);
+    }
+
+    /**
+     * 能量入口：从赛车淘金币首页右下“赚金币 / 赚能量”两侧按钮区域定位“赚能量”，
+     * 点击后以“做任务赚能量”+“累计任务奖励/当前进度/具体任务行”组合证据确认面板。
+     */
+    private boolean openEnergyPanel() throws Exception {
+        logMode("定位“做任务赚能量”面板");
+
+        // 能量面板若已打开，直接复用当前页面，不再找“赚能量”入口。
+        if (isEnergyTaskPanelVisibleForNavigation()) {
+            return ensureEnergyPanelReady();
+        }
+
+        for (int i = 1; i <= 3 && !stopRequested; i++) {
+            OcrEngine.Snapshot snap;
+            try {
+                snap = ocr.captureNavigation();
+            } catch (Throwable e) {
+                logMode("能量导航 OCR 失败: " + e.getMessage());
+                sleep(500);
+                continue;
+            }
+
+            // P0：先认证合法能量面板，再考虑遮挡关闭，避免把已打开的面板误关。
+            if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)) {
+                logMode("OCR 已确认能量面板已打开");
+                return ensureEnergyPanelReady();
+            }
+
+            if (dismissBlockingPopupIfPresent(snap, "淘金币首页")) {
+                sleep(850);
+                continue;
+            }
+
+            int[] p = findEnergyEntryPoint(snap);
+            if (p != null) {
+                shellTap(p[0], p[1]);
+                logMode("点击淘金币首页右侧“赚能量”入口: (" + p[0] + ", " + p[1] + ")");
+                sleep(2200);
+                if (isEnergyTaskPanelVisibleForNavigation()) {
+                    return ensureEnergyPanelReady();
+                }
+                // 已点击但未确认，继续用新帧重定位，不重复点固定坐标。
+            } else {
+                logMode("第 " + i + "/3 次未在淘金币首页定位到“赚能量”入口");
+                sleep(500);
+            }
+        }
+
+        logMode("未能确认进入能量任务面板");
+        return false;
+    }
+
+    private boolean ensureEnergyPanelReady() throws Exception {
+        if (!TB.equals(currentPackage())) return false;
+        for (int attempt = 1; attempt <= 3 && !stopRequested; attempt++) {
+            OcrEngine.Snapshot snap;
+            try {
+                snap = ocr.captureTaskPanel();
+            } catch (Throwable e) {
+                logMode("能量任务面板 OCR 失败: " + e.getMessage());
+                sleep(420);
+                continue;
+            }
+
+            // P0：先认证合法能量面板，再考虑遮挡关闭，避免面板刚打开就被误关。
+            if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)) {
+                energyPanelConfirmed = true;
+                logMode("已确认“做任务赚能量”任务面板，可进入主循环");
+                return true;
+            }
+
+            if (dismissBlockingPopupIfPresent(snap, "能量任务面板")) {
+                sleep(800);
+                continue;
+            }
+
+            logMode("第 " + attempt + "/3 次未确认能量面板特征，等待刷新");
+            if (attempt >= 2) logMode("能量面板 OCR 摘要: " + summarizeOcrSnippet(snap));
+            sleep(420);
+        }
+        return false;
+    }
+
+    private boolean isEnergyTaskPanelVisibleForNavigation() {
+        if (!TB.equals(currentPackage())) return false;
+        try {
+            OcrEngine.Snapshot snap = ocr.captureNavigation();
+            boolean hit = TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height);
+            if (hit) logMode("OCR 已确认“做任务赚能量”任务面板已打开");
+            return hit;
+        } catch (Throwable e) {
+            logMode("能量任务面板 OCR 确认失败: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** 能量任务列表可执行的视觉判定。 */
+    private boolean isEnergyTaskListVisible() {
+        ForegroundState fg = currentForeground();
+        if (!fg.isPackage(TB)) return false;
+        try {
+            OcrEngine.Snapshot snap = ocr.captureTaskPanel();
+            if (TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap)) {
+                List<TaskParser.TaskItem> tasks = TaskParser.parseEnergyActionable(snap.rows, snap.height);
+                logMode("能量任务面板认证通过：可见带进度任务 " + tasks.size() + " 个");
+                return true;
+            }
+        } catch (Throwable e) {
+            logMode("能量任务区域 OCR 强认证失败: " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * 在淘金币首页较靠下区域定位右侧“赚能量”按钮。
+     * 优先精确元素，其次处理“赚金币 赚能量”合并成一行时按子串位置点击。
+     * 禁止无条件点击固定坐标。
+     */
+    private int[] findEnergyEntryPoint(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        int minY = (int) (snap.height * 0.40f);
+        int maxY = (int) (snap.height * 0.88f);
+
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                String t = normalizeOcr(e.text);
+                if (!t.equals("赚能量")) continue;
+                int y = e.bounds.centerY();
+                if (y < minY || y > maxY) continue;
+                return new int[]{e.bounds.centerX(), y};
+            }
+        }
+
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (!t.contains("赚能量")) continue;
+            int y = row.bounds.centerY();
+            if (y < minY || y > maxY) continue;
+            int idx = t.indexOf("赚能量");
+            int x;
+            if (t.length() <= 3) {
+                x = row.bounds.centerX();
+            } else {
+                float charCenter = idx + 1.5f;
+                float ratio = charCenter / Math.max(1f, t.length());
+                x = row.bounds.left + Math.round(row.bounds.width() * ratio);
+            }
+            return new int[]{Math.max(24, Math.min(snap.width - 24, x)), y};
+        }
+        return null;
+    }
+
+    /** 能量模式收尾：回顶复查 + 5/20/50 累计任务奖励独立领取。 */
+    private boolean energyRewardSweep() throws Exception {
+        if (stopRequested) return false;
+        AppState.status = "收尾复查";
+        logMode("开始收尾：先强制返回能量任务面板顶部，再复查未完成任务");
+
+        if (!TB.equals(currentPackage())) {
+            logMode("收尾时已离开淘宝，先恢复能量任务页");
+            if (!enterTaskList(true, TaskMode.DOUBLE11_ENERGY)) {
+                logMode("收尾恢复失败，跳过领奖并结束");
+                return false;
+            }
+        }
+
+        OcrEngine.Snapshot topSnap = rewindEnergyPanelToTop();
+        if (stopRequested || topSnap == null) return false;
+
+        OcrEngine.Snapshot taskRecheckSnap = ocr.captureTaskList();
+        List<TaskParser.TaskItem> topTasks = TaskParser.parseEnergyActionable(taskRecheckSnap.rows, taskRecheckSnap.height);
+        logMode("收尾复查：顶部识别到 " + topTasks.size() + " 个能量任务");
+        TaskParser.TaskItem unfinished = null;
+        for (TaskParser.TaskItem task : topTasks) {
+            String skipReason = TaskParser.skipReason(task, taskRules);
+            if (skipReason != null) {
+                logMode("收尾复查跳过[" + skipReason + "]: " + task.name);
+                continue;
+            }
+            if (attempted.getOrDefault(stableTaskId(task), 0) >= 2) {
+                logMode("收尾复查发现未完成任务但已达到尝试上限，跳过: " + task.name);
+                continue;
+            }
+            unfinished = task;
+            break;
+        }
+
+        if (unfinished != null && finalTopRecheckRounds < 2) {
+            finalTopRecheckRounds++;
+            logMode("收尾复查发现仍有可执行能量任务: " + unfinished.name
+                    + "；返回主循环继续执行 (" + finalTopRecheckRounds + "/2)");
+            AppState.status = "识别任务中";
+            return true;
+        }
+
+        if (unfinished != null) {
+            logMode("收尾复查仍看到未完成能量任务，但已达到复查轮次上限；为避免循环，继续领奖并结束");
+        } else {
+            logMode("收尾复查：顶部未发现黑名单外的未完成能量任务，检查累计任务奖励");
+        }
+
+        AppState.status = "收尾领奖";
+        claimEnergyCumulativeReward(topSnap);
+        AppState.status = "识别任务中";
+        return false;
+    }
+
+    private OcrEngine.Snapshot rewindEnergyPanelToTop() throws Exception {
+        String lastSignature = "";
+        int unchanged = 0;
+        OcrEngine.Snapshot snap = null;
+        for (int i = 1; i <= 8 && !stopRequested; i++) {
+            snap = ocr.captureTaskPanel();
+            String all = normalizeOcr(snap.allText());
+
+            if (i > 1 && isEnergyRewardPanelTop(all)) {
+                logMode("已确认回到能量任务面板顶部");
+                break;
+            }
+
+            String sig = compactPanelSignature(snap);
+            if (!sig.isEmpty() && sig.equals(lastSignature)) unchanged++; else unchanged = 0;
+            lastSignature = sig;
+            if (i > 2 && unchanged >= 2) {
+                logMode("连续两次向上滑动后画面未变化，按当前画面视为顶部");
+                break;
+            }
+
+            logMode("收尾：向上返回能量面板顶部 (" + i + "/8)");
+            shellSwipeToTop(snap.width, snap.height);
+            sleep(650);
+        }
+
+        if (stopRequested) return snap;
+        snap = ocr.captureTaskPanel();
+        logMode("已回到顶部，开始复查能量任务与奖励");
+        return snap;
+    }
+
+    private boolean isEnergyRewardPanelTop(String normalizedAll) {
+        if (normalizedAll == null) return false;
+        return normalizedAll.contains("累计任务奖励") || normalizedAll.contains("当前进度");
+    }
+
+    /**
+     * 能量累计任务奖励：只在“当前进度”达到 5/20/50 任一门槛、且明确看到可领按钮时点击。
+     * 绝不照搬金币经典版的三个固定 X 点位。
+     */
+    private void claimEnergyCumulativeReward(OcrEngine.Snapshot topSnap) throws Exception {
+        if (topSnap == null) return;
+        int[] progress = TaskParser.energyCumulativeProgress(topSnap.rows);
+        if (progress == null) {
+            logMode("未识别到“累计任务奖励/当前进度”，跳过能量领奖避免误点");
+            return;
+        }
+        int current = progress[0];
+        logMode("能量累计任务奖励进度: " + current + "/" + progress[1]);
+
+        int threshold;
+        if (current >= 50) threshold = 50;
+        else if (current >= 20) threshold = 20;
+        else if (current >= 5) threshold = 5;
+        else threshold = 0;
+
+        if (threshold <= 0) {
+            logMode("当前进度 " + current + " 未达 5/20/50 任一门槛，跳过能量领奖");
+            return;
+        }
+
+        int[] claim = findEnergyClaimPoint(topSnap);
+        if (claim == null) {
+            logMode("达到 " + threshold + " 次门槛，但未找到明确可领按钮，跳过避免误点");
+            return;
+        }
+        shellTap(claim[0], claim[1]);
+        logMode("已点击能量累计奖励领取按钮 (" + claim[0] + ", " + claim[1] + ")");
+        sleep(800);
+    }
+
+    private int[] findEnergyClaimPoint(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        int anchorY = -1;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            if (normalizeOcr(row.text).contains("累计任务奖励")) {
+                anchorY = row.bounds.centerY();
+                break;
+            }
+        }
+        if (anchorY < 0) return null;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            int y = row.bounds.centerY();
+            if (Math.abs(y - anchorY) > 260) continue;
+            String t = normalizeOcr(row.text);
+            // 只认“立即领取”或单独“领取”，避免把任务行的“领取奖励”当累计奖励点击。
+            if (t.contains("立即领取") || t.equals("领取")) {
+                return new int[]{Math.max(24, Math.min(snap.width - 24, row.bounds.centerX())), y};
+            }
+        }
+        return null;
     }
 
 
@@ -1364,15 +2387,16 @@ public class AutomationService extends Service {
      *
      * @return true 表示顶部复查发现了新的可执行任务，调用方应继续 mainLoop。
      */
-    private boolean finalRewardSweep() throws Exception {
+    private boolean finalRewardSweep(TaskMode mode) throws Exception {
+        if (mode == TaskMode.DOUBLE11_ENERGY) return energyRewardSweep();
         if (stopRequested) return false;
         AppState.status = "收尾复查";
-        AppState.log("开始收尾：先强制返回任务面板顶部，再复查未完成任务");
+        logMode("开始收尾：先强制返回任务面板顶部，再复查未完成任务");
 
         if (!TB.equals(currentPackage())) {
-            AppState.log("收尾时已离开淘宝，先恢复淘金币任务页");
-            if (!enterTaskList(true)) {
-                AppState.log("收尾恢复失败，跳过领奖并结束");
+            logMode("收尾时已离开淘宝，先恢复淘金币任务页");
+            if (!enterTaskList(true, mode)) {
+                logMode("收尾恢复失败，跳过领奖并结束");
                 return false;
             }
         }
@@ -1384,12 +2408,16 @@ public class AutomationService extends Service {
         // 最多允许触发两轮，避免某个失败任务导致“到底 -> 回顶部 -> 再到底”的死循环。
         OcrEngine.Snapshot taskRecheckSnap = ocr.captureTaskList();
         List<TaskParser.TaskItem> topTasks = TaskParser.parse(taskRecheckSnap.rows, taskRecheckSnap.height);
-        AppState.log("收尾复查：顶部识别到 " + topTasks.size() + " 个带进度任务");
+        logMode("收尾复查：顶部识别到 " + topTasks.size() + " 个带进度任务");
         TaskParser.TaskItem unfinished = null;
         for (TaskParser.TaskItem task : topTasks) {
-            if (TaskParser.skip(task, taskRules)) continue;
-            if (attempted.getOrDefault(task.name, 0) >= 2) {
-                AppState.log("收尾复查发现未完成任务但已达到尝试上限，跳过: " + task.name);
+            String skipReason = TaskParser.skipReason(task, taskRules);
+            if (skipReason != null) {
+                logMode("收尾复查跳过[" + skipReason + "]: " + task.name);
+                continue;
+            }
+            if (attempted.getOrDefault(stableTaskId(task), 0) >= 2) {
+                logMode("收尾复查发现未完成任务但已达到尝试上限，跳过: " + task.name);
                 continue;
             }
             unfinished = task;
@@ -1398,16 +2426,16 @@ public class AutomationService extends Service {
 
         if (unfinished != null && finalTopRecheckRounds < 2) {
             finalTopRecheckRounds++;
-            AppState.log("收尾复查发现仍有可执行任务: " + unfinished.name
+            logMode("收尾复查发现仍有可执行任务: " + unfinished.name
                     + "；返回主循环继续执行 (" + finalTopRecheckRounds + "/2)");
             AppState.status = "识别任务中";
             return true;
         }
 
         if (unfinished != null) {
-            AppState.log("收尾复查仍看到未完成任务，但已达到复查轮次上限；为避免循环，继续领奖并结束");
+            logMode("收尾复查仍看到未完成任务，但已达到复查轮次上限；为避免循环，继续领奖并结束");
         } else {
-            AppState.log("收尾复查：顶部未发现黑名单外的未完成任务，开始检查奖励");
+            logMode("收尾复查：顶部未发现黑名单外的未完成任务，开始检查奖励");
         }
 
         AppState.status = "收尾领奖";
@@ -1431,17 +2459,17 @@ public class AutomationService extends Service {
             if (frame.equals(lastClaimFrame)) unchanged++; else unchanged = 0;
             lastClaimFrame = frame;
             if (unchanged >= 2) {
-                AppState.log("领奖按钮画面连续未变化，停止重复点击");
+                logMode("领奖按钮画面连续未变化，停止重复点击");
                 break;
             }
 
             shellTap(claim[0], claim[1]);
             claimed++;
-            AppState.log("收尾领奖：点击可领取奖励 (" + claim[0] + ", " + claim[1] + ")");
+            logMode("收尾领奖：点击可领取奖励 (" + claim[0] + ", " + claim[1] + ")");
             sleep(850);
         }
 
-        AppState.log(claimed > 0
+        logMode(claimed > 0
                 ? "收尾领奖完成：额外点击可领取按钮 " + claimed + " 次"
                 : "收尾领奖完成：未发现额外可领取按钮");
         AppState.status = "识别任务中";
@@ -1463,7 +2491,7 @@ public class AutomationService extends Service {
 
             // 第一轮无条件滑一下，确保经典版不会因为固定标题而直接进入领奖。
             if (i > 1 && isStrongRewardPanelTop(all)) {
-                AppState.log("已确认回到任务面板顶部");
+                logMode("已确认回到任务面板顶部");
                 break;
             }
 
@@ -1471,18 +2499,18 @@ public class AutomationService extends Service {
             if (!sig.isEmpty() && sig.equals(lastSignature)) unchanged++; else unchanged = 0;
             lastSignature = sig;
             if (i > 2 && unchanged >= 2) {
-                AppState.log("连续两次向上滑动后画面未变化，按当前画面视为顶部");
+                logMode("连续两次向上滑动后画面未变化，按当前画面视为顶部");
                 break;
             }
 
-            AppState.log("收尾：向上返回任务面板顶部 (" + i + "/8)");
+            logMode("收尾：向上返回任务面板顶部 (" + i + "/8)");
             shellSwipeToTop(snap.width, snap.height);
             sleep(650);
         }
 
         if (stopRequested) return snap;
         snap = ocr.captureTaskPanel();
-        AppState.log("已回到顶部，开始复查任务与奖励");
+        logMode("已回到顶部，开始复查任务与奖励");
         return snap;
     }
 
@@ -1519,12 +2547,12 @@ public class AutomationService extends Service {
         if (snap == null) return;
         String all = normalizeOcr(snap.allText());
         if (all.contains("今日累计奖励") || all.contains("赚金币抵钱")) {
-            AppState.log("界面识别：经典‘赚金币抵钱’任务面板");
+            logMode("界面识别：经典‘赚金币抵钱’任务面板");
         } else if (all.contains("今日速赚") || (all.contains("今日速") && all.contains("淘金币"))
                 || (all.contains("完成下方任务") && all.contains("金币"))) {
-            AppState.log("界面识别：新版‘今日速赚’任务面板");
+            logMode("界面识别：新版‘今日速赚’任务面板");
         } else {
-            AppState.log("界面识别：未明确区分新旧版，继续使用通用 OCR 流程");
+            logMode("界面识别：未明确区分新旧版，继续使用通用 OCR 流程");
         }
     }
 
@@ -1537,7 +2565,7 @@ public class AutomationService extends Service {
             }
         }
         if (anchorY < 0) {
-            AppState.log("经典版收尾：未明确识别到‘今日累计奖励’，为避免误点任务，不使用坐标兜底");
+            logMode("经典版收尾：未明确识别到‘今日累计奖励’，为避免误点任务，不使用坐标兜底");
             return;
         }
 
@@ -1546,7 +2574,7 @@ public class AutomationService extends Service {
                 (int) (snap.width * 0.66f),
                 (int) (snap.width * 0.87f)
         };
-        AppState.log("经典版收尾：检查‘今日累计奖励’三个奖励槽");
+        logMode("经典版收尾：检查‘今日累计奖励’三个奖励槽");
         for (int x : xs) {
             if (stopRequested) return;
             shellTap(x, anchorY);
@@ -1626,11 +2654,11 @@ public class AutomationService extends Service {
             OcrEngine.Snapshot snap = ocr.captureNavigation();
             boolean hit = looksLikeCoinHomeSnapshot(snap);
             if (hit) {
-                AppState.log("OCR 已确认当前为淘金币首页（特征分=" + coinHomeEvidenceScore(snap) + ")");
+                logMode("OCR 已确认当前为淘金币首页（特征分=" + coinHomeEvidenceScore(snap) + ")");
             }
             return hit;
         } catch (Throwable e) {
-            AppState.log("淘金币首页 OCR 确认失败: " + e.getMessage());
+            logMode("淘金币首页 OCR 确认失败: " + e.getMessage());
             return false;
         }
     }
@@ -1643,7 +2671,7 @@ public class AutomationService extends Service {
             shellTap(p[0], p[1]);
             return true;
         } catch (Throwable e) {
-            AppState.log("OCR 导航兜底失败: " + e.getMessage());
+            logMode("OCR 导航兜底失败: " + e.getMessage());
         }
         return false;
     }
@@ -1663,7 +2691,31 @@ public class AutomationService extends Service {
         if (snap == null || stopRequested) return false;
         if (!TB.equals(currentPackage())) return false;
 
+        // §3 P0：高置信促销覆盖层（“看…得能量”）必须先于 KEEP_PANEL 面板保护判定。
+        // 该弹窗会遮住能量面板/赛车首页，但背景的任务行、标题仍能被 OCR 看到，
+        // 若先走面板保护会把真正的阻塞弹窗放行。判定要求两个相互独立且空间位置
+        // 合理的证据（标题“看…得能量” + “去浏览加抵好物”或“浏览商品…得”），
+        // 单独的 能量/立即领取/奖励 字样绝不触发。默认不点击“去浏览加抵好物”。
+        if (detectPromoOverlay(snap)) {
+            return handlePromoOverlay(snap, stage);
+        }
+
+        // P0：合法能量任务面板优先于普通弹窗关闭。
+        // 能量模式下，若当前截图有可信能量任务面板证据（明确标题锚点 + 奖励/任务动作
+        // 组合，或已认证后的列表上下文），绝不可执行 Back 关闭；否则会把已成功打开的
+        // “做任务赚能量”面板误当成广告弹窗关掉，陷入“打开→关闭→重试”死循环。
+        if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            boolean trusted = TaskParser.isTrustedEnergyTaskPanel(snap.rows, snap.height)
+                    || isEnergyTaskListContext(snap);
+            if (trusted) {
+                logMode("弹窗判定 page=" + stage + " mode=能量 trusted=true action=KEEP_PANEL"
+                        + "（合法能量任务面板，不执行 Back）");
+                return false;
+            }
+        }
+
         String all = normalizeOcr(snap.allText());
+        List<String> hits = new ArrayList<>();
         int score = 0;
 
         // 高特异文案：这些内容通常只会出现在覆盖式促销/引导弹窗中。
@@ -1673,18 +2725,18 @@ public class AutomationService extends Service {
                 "出行玩乐", "订票订酒店", "闪购福利"
         };
         for (String k : strong) {
-            if (all.contains(normalizeOcr(k))) score += 2;
+            if (all.contains(normalizeOcr(k))) { score += 2; hits.add("强:" + k); }
         }
         // 这些词在普通淘宝页面也可能出现，只作为弱证据，不能单独触发 Back。
         String[] weak = new String[]{"淘宝闪购", "加抵金", "抵金", "额外抵", "去看看"};
         for (String k : weak) {
-            if (all.contains(normalizeOcr(k))) score += 1;
+            if (all.contains(normalizeOcr(k))) { score += 1; hits.add("弱:" + k); }
         }
 
         // 背景仍像淘金币/任务页时，中间出现大 CTA 更像是“盖在原页面上的弹窗”。
         boolean backgroundContext = looksLikeCoinHomeSnapshot(snap)
-                || taskPanelVisibleInSnapshot(snap)
-                || TaskParser.isTrustedTaskContext(snap.rows, snap.height);
+                || taskPanelVisibleForMode(snap)
+                || isTaskContextForMode(snap);
         boolean centeredCta = false;
         for (OcrEngine.OcrRow row : snap.rows) {
             String t = normalizeOcr(row.text);
@@ -1702,19 +2754,146 @@ public class AutomationService extends Service {
                 break;
             }
         }
-        if (backgroundContext && centeredCta) score += 2;
+        if (backgroundContext && centeredCta) { score += 2; hits.add("背景+居中CTA"); }
 
-        if (score < 3) return false;
+        String hitDesc = hits.isEmpty() ? "无" : String.join(",", hits);
+        if (score < 3) {
+            logMode("弹窗判定 page=" + stage + " mode=" + currentMode.label
+                    + " trusted=false hits=[" + hitDesc + "] centeredCta=" + centeredCta
+                    + " score=" + score + " action=KEEP");
+            return false;
+        }
         if (popupDismissCount >= 6) {
-            AppState.log("疑似遮挡弹窗仍反复出现，但已达到本轮自动关闭上限；交给页面恢复流程处理");
+            logMode("弹窗判定 page=" + stage + " mode=" + currentMode.label
+                    + " hits=[" + hitDesc + "] score=" + score
+                    + " 已达自动关闭上限，交给页面恢复流程");
             return false;
         }
 
         popupDismissCount++;
-        AppState.log("检测到疑似遮挡弹窗（" + stage + "，证据分=" + score + "），优先使用系统返回关闭 ("
-                + popupDismissCount + "/6)");
+        logMode("弹窗判定 page=" + stage + " mode=" + currentMode.label
+                + " trusted=false hits=[" + hitDesc + "] centeredCta=" + centeredCta
+                + " score=" + score + " action=BACK（" + popupDismissCount + "/6）");
         ShizukuShell.exec("input keyevent KEYCODE_BACK");
         return true;
+    }
+
+    /**
+     * “看…得能量”促销覆盖层检测。要求两个相互独立且空间位置合理的证据：
+     * 1) 屏幕上半部出现“看…得能量”标题（如 看抵扣快闪得能量 / 看宠物好货得能量）；
+     * 2) 中下部出现“去浏览加抵好物”CTA 或“浏览商品…得”文案。
+     * 单独的 能量/立即领取/奖励/去完成 字样绝不触发，避免误伤合法能量任务面板。
+     */
+    private boolean detectPromoOverlay(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        boolean titleHit = false;
+        boolean ctaHit = false;
+        boolean browseNoteHit = false;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (t.isEmpty()) continue;
+            int cy = row.bounds.centerY();
+            if (!titleHit && cy < snap.height * 0.50f
+                    && t.length() <= 18
+                    && PROMO_OVERLAY_TITLE.matcher(t).find()) {
+                titleHit = true;
+            }
+            if (!ctaHit && cy > snap.height * 0.42f
+                    && (t.contains("去浏览加抵好物") || fuzzyContains(t, "去浏览加抵好物", 1))) {
+                ctaHit = true;
+            }
+            if (!browseNoteHit && cy > snap.height * 0.20f && cy < snap.height * 0.65f
+                    && t.contains("浏览商品") && t.contains("得")) {
+                browseNoteHit = true;
+            }
+            if (titleHit && (ctaHit || browseNoteHit)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 促销覆盖层处理：BACK 优先（最多 2 次），仍无效且存在安全 X 证据时点击一次 X，
+     * 每次动作后截图复查；全程不点击“去浏览加抵好物”购物 CTA。总上限 3 次，
+     * 超限后交由页面恢复流程/人工处理。
+     */
+    private boolean handlePromoOverlay(OcrEngine.Snapshot snap, String stage) {
+        if (promoOverlayActions >= 3) {
+            logMode("promoOverlay=true page=" + stage
+                    + " action=GIVE_UP（已达 3 次处理上限，不点购物 CTA，交由页面恢复/人工处理）");
+            return false;
+        }
+        promoOverlayActions++;
+        if (promoOverlayActions <= 2) {
+            logMode("promoOverlay=true page=" + stage
+                    + " evidence=[看…得能量标题 + 去浏览加抵好物/浏览商品15s得] action=BACK（"
+                    + promoOverlayActions + "/3）");
+            ShizukuShell.exec("input keyevent KEYCODE_BACK");
+        } else {
+            int[] x = findPromoCloseX(snap);
+            if (x == null) {
+                promoOverlayActions--;
+                logMode("promoOverlay=true page=" + stage
+                        + " action=SKIP（Back 未生效且未定位到安全的关闭 X；不点击购物 CTA）");
+                return false;
+            }
+            logMode("promoOverlay=true page=" + stage
+                    + " action=SAFE_X（" + x[0] + "," + x[1] + "）（" + promoOverlayActions + "/3）");
+            try {
+                shellTap(x[0], x[1]);
+            } catch (Exception tapError) {
+                logMode("promoOverlay 点击安全 X 失败: " + tapError.getMessage());
+            }
+        }
+        try {
+            sleep(900);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+        boolean recovered = false;
+        try {
+            OcrEngine.Snapshot check = ocr.captureNavigation();
+            recovered = !detectPromoOverlay(check);
+        } catch (Throwable ignored) {}
+        logMode("promoOverlay 复查: " + (recovered ? "覆盖层已消失" : "覆盖层仍在或未确认，等待下一轮处理"));
+        return true;
+    }
+
+    /**
+     * 在促销覆盖层上定位“关闭 X”：仅接受 OCR 元素级、单字符 X/×/✕、
+     * 尺寸小且位于弹窗边缘区域的目标；找不到返回 null，不做坐标猜测。
+     */
+    private int[] findPromoCloseX(OcrEngine.Snapshot snap) {
+        if (snap == null || snap.elements == null) return null;
+        for (OcrEngine.OcrRow e : snap.elements) {
+            String t = normalizeOcr(e.text);
+            if (!(t.equals("X") || t.equals("×") || t.equals("x") || t.equals("✕"))) continue;
+            if (e.bounds.width() > snap.width * 0.08f) continue;
+            int cy = e.bounds.centerY();
+            if (cy < snap.height * 0.25f || cy > snap.height * 0.95f) continue;
+            int cx = e.bounds.centerX();
+            if (cx < snap.width * 0.10f || cx > snap.width * 0.90f) continue;
+            return new int[]{cx, cy};
+        }
+        return null;
+    }
+
+    /**
+     * 安全裁剪的 OCR 摘要：只输出前若干行文字并限制长度，用于两次认证失败后的诊断，
+     * 不包含完整截图、账号、地址、订单或 token 等敏感信息。
+     */
+    private String summarizeOcrSnippet(OcrEngine.Snapshot snap) {
+        if (snap == null) return "<无截图>";
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (t.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(" | ");
+            sb.append(t);
+            count++;
+            if (count >= 14 || sb.length() > 240) break;
+        }
+        return sb.length() == 0 ? "<无文字>" : sb.toString();
     }
 
     private String normalizeOcr(String text) {
@@ -1736,10 +2915,10 @@ public class AutomationService extends Service {
         try {
             OcrEngine.Snapshot snap = ocr.captureNavigation();
             boolean hit = taskPanelVisibleInSnapshot(snap);
-            if (hit) AppState.log("OCR 已确认‘今日速赚/更多金币’等任务弹窗已打开");
+            if (hit) logMode("OCR 已确认‘今日速赚/更多金币’等任务弹窗已打开");
             return hit;
         } catch (Throwable e) {
-            AppState.log("任务弹窗 OCR 确认失败: " + e.getMessage());
+            logMode("任务弹窗 OCR 确认失败: " + e.getMessage());
             return false;
         }
     }
@@ -1879,7 +3058,7 @@ public class AutomationService extends Service {
                 if (!normalizeOcr(row.text).contains("取消")) continue;
                 Rect r = row.bounds;
                 shellTap(r.centerX(), r.centerY());
-                AppState.log("OCR 检测到‘浏览器打开’弹窗，已点击取消");
+                logMode("OCR 检测到‘浏览器打开’弹窗，已点击取消");
                 return true;
             }
         } catch (Throwable ignored) {}

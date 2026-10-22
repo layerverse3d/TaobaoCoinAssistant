@@ -27,17 +27,20 @@ import android.widget.TextView;
 public final class StatusOverlay {
     private final Context context;
     private final Runnable stopAction;
+    private final Runnable restartAction;
     private final WindowManager windowManager;
 
     private LinearLayout root;
     private TextView statusView;
     private TextView stopView;
+    private TextView restartView;
     private boolean attached = false;
     private boolean creationFailed = false;
 
-    public StatusOverlay(Context context, Runnable stopAction) {
+    public StatusOverlay(Context context, Runnable stopAction, Runnable restartAction) {
         this.context = context.getApplicationContext();
         this.stopAction = stopAction;
+        this.restartAction = restartAction;
         this.windowManager = (WindowManager) this.context.getSystemService(Context.WINDOW_SERVICE);
     }
 
@@ -77,6 +80,29 @@ public final class StatusOverlay {
         stopBg.setCornerRadius(dp(7));
         stopView.setBackground(stopBg);
         root.addView(stopView, new LinearLayout.LayoutParams(-2, dp(24)));
+
+        // 停止/异常/完成后显示“重新开始”：由服务串行调度，从当前页面原地恢复，
+        // 不重启淘宝；与“停止”按钮互斥显示。
+        restartView = new TextView(context);
+        restartView.setText("重新开始");
+        restartView.setTextColor(Color.WHITE);
+        restartView.setTextSize(10);
+        restartView.setGravity(Gravity.CENTER);
+        restartView.setPadding(dp(9), 0, dp(9), 0);
+        restartView.setMinWidth(dp(56));
+        restartView.setOnClickListener(v -> {
+            restartView.setPressed(true);
+            restartView.postDelayed(() -> {
+                if (restartView != null) restartView.setPressed(false);
+            }, 180);
+            restartAction.run();
+        });
+
+        GradientDrawable restartBg = new GradientDrawable();
+        restartBg.setColor(0xD91B7A45);
+        restartBg.setCornerRadius(dp(7));
+        restartView.setBackground(restartBg);
+        root.addView(restartView, new LinearLayout.LayoutParams(-2, dp(24)));
 
         int screenWidth = context.getResources().getDisplayMetrics().widthPixels;
         int width = Math.min(Math.max(dp(220), screenWidth - dp(16)), dp(330));
@@ -118,14 +144,18 @@ public final class StatusOverlay {
         root = null;
         statusView = null;
         stopView = null;
+        restartView = null;
     }
 
     public void update() {
         if (!attached || root == null) return;
         root.post(() -> {
-            if (!attached || statusView == null || stopView == null) return;
+            if (!attached || statusView == null || stopView == null || restartView == null) return;
+            boolean running = AppState.running;
             statusView.setText(AppState.displayStatus());
-            stopView.setVisibility(AppState.running ? View.VISIBLE : View.GONE);
+            // 运行中显示“停止”；停止/异常/完成后切换为“重新开始”。
+            stopView.setVisibility(running ? View.VISIBLE : View.GONE);
+            restartView.setVisibility(running ? View.GONE : View.VISIBLE);
         });
     }
 
