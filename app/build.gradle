@@ -12,8 +12,8 @@ android {
         applicationId 'com.layerverse.taobaocoinassistant'
         minSdk 30
         targetSdk 36
-        versionCode 113
-        versionName '1.2-d11-fix6'
+        versionCode 120
+        versionName '1.2.0-d11'
     }
 
 
