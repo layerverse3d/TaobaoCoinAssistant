@@ -1,0 +1,43 @@
+name: Publish v1.2.0-d11 source release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - README.md
+      - app/build.gradle
+
+permissions:
+  contents: write
+
+jobs:
+  source-release:
+    if: github.repository == 'layerverse3d/TaobaoCoinAssistant'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release if absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.2.0-d11"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it unchanged."
+            exit 0
+          fi
+          cat > /tmp/release-notes.md <<'NOTES'
+          ## 淘金币助手 · 2026 双11扩展版（个人 Fork）
+
+          基于 [Doplars/TaobaoCoinAssistant](https://github.com/Doplars/TaobaoCoinAssistant) 修改；**非原作者官方版本**。
+
+          - ⚡ 自动进入双十一赛车活动「赚能量」任务面板，支持常规浏览、搜索发现推荐项、部分答题与累计奖励的识别处理。
+          - 🪙 适配双十一活动左侧「去赚金币」入口，兼容原有金币自动任务流程。
+          - 共享黑名单与规则迁移，OCR 安全判断、悬浮窗原地重启、日志跟随/复制/清空。
+          - 2026-10-22 在 **小米 13 Ultra** 上验证：能量主要任务、金币任务入口与大部分旧功能可用。金币个别任务仍可能不兼容。
+
+          **发布范围：**仅提供本次 GitHub 源码快照，不附加 APK。当前 CI 产生临时签名 Debug APK，不具备长期稳定更新签名；上游仓库也未见明确 LICENSE，修改和再分发仍需尊重原作者权利。
+
+          安装、局限与项目来源详见 README。请勿将此 Fork 视为淘宝或原作者的官方客户端。
+          NOTES
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "v1.2.0-d11 · 双11能量扩展版（源码）" --notes-file /tmp/release-notes.md
