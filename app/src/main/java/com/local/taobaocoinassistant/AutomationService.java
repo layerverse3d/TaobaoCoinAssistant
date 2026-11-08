@@ -17,7 +17,6 @@ import android.os.Looper;
 import android.os.SystemClock;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -74,11 +73,32 @@ public class AutomationService extends Service {
     // 本轮已对“看…得能量”促销覆盖层执行的动作次数（BACK/安全X），上限 3 次，防止连续乱按。
     private int promoOverlayActions = 0;
 
-    // 当新版 UC WebView 不暴露 EditText 时，Android shell 的 `input text` 对中文并不可靠。
-    // 因此 OCR+Shizuku 兜底使用纯 ASCII 搜索词；只用于完成“搜一搜”任务，不改变任务筛选规则。
-    private static final List<String> SEARCH_KEYS_ASCII = Arrays.asList(
-            "iphone", "macbook", "xiaomi", "camera", "milk"
-    );
+    // 搜索词轮转索引：避免一次 0/5 循环总选到同一个词；每轮执行前重置。
+    private int lastSearchKeywordIndex = -1;
+
+    // 搜索词池：显示名（中文/品牌，用于日志）映射到安全 ASCII 实际输入值。
+    // Android shell 的 `input text` 对中文/空格/特殊字符不可靠，因此实际输入只允许纯 ASCII 字母数字；
+    // 大小写按表格保留，若淘宝/输入法将其规范化为小写不视为失败，以搜索结果与进度确认为准。
+    // 仅用于完成“搜一搜”任务，绝不加入任务黑名单或分类规则。
+    private static final class SearchKeyword {
+        final String display;
+        final String ascii;
+        SearchKeyword(String display, String ascii) { this.display = display; this.ascii = ascii; }
+    }
+
+    private static final SearchKeyword[] SEARCH_KEYWORDS = new SearchKeyword[]{
+            new SearchKeyword("iPhone", "iPhone"),
+            new SearchKeyword("iPad", "iPad"),
+            new SearchKeyword("MacBook", "MacBook"),
+            new SearchKeyword("小米", "Xiaomi"),
+            new SearchKeyword("咖啡豆", "coffeeBeans"),
+            new SearchKeyword("相机", "camera"),
+            new SearchKeyword("路由器", "router"),
+            new SearchKeyword("键盘", "keyboard"),
+            new SearchKeyword("固态硬盘", "SSD"),
+            new SearchKeyword("3D打印耗材", "PETG"),
+            new SearchKeyword("牛奶", "milk")
+    };
 
     // “看…得能量”促销覆盖层标题锚（看抵扣快闪得能量 / 看宠物好货得能量 等变体）。
     private static final Pattern PROMO_OVERLAY_TITLE = Pattern.compile("看.{1,10}得能量");
@@ -267,6 +287,7 @@ public class AutomationService extends Service {
         saveLastMode(currentMode);
         energyPanelConfirmed = false;
         promoOverlayActions = 0;
+        lastSearchKeywordIndex = -1;
         automationJobActive = true;
         stopRequested = false;
         attempted.clear();
@@ -699,11 +720,11 @@ public class AutomationService extends Service {
         // 能量模式受限搜索候选：OCR 截断的“你喜欢的宝贝(0/5)”仍应按搜索流程执行。
         boolean energySearchCandidate = currentMode == TaskMode.DOUBLE11_ENERGY
                 && TaskParser.isEnergySearchCandidate(task);
-        if (energySearchCandidate && !searchTask) {
-            logMode("SEARCH_CLASSIFY raw=" + task.name
-                    + " reason=energy_title_variant confidence=candidate");
-        }
         searchTask = searchTask || energySearchCandidate;
+        if (searchTask) {
+            logMode("SEARCH_CLASSIFY task=" + task.name + " mode=search"
+                    + (energySearchCandidate ? " reason=energy_title_variant" : ""));
+        }
         logMode("准备执行任务[" + TaskParser.displayMode(task, taskRules) + "]: " + task.name);
 
         int x = (int) (width * 0.875f);
@@ -713,17 +734,18 @@ public class AutomationService extends Service {
 
         // 答题页双层认证分流：黑名单已在候选循环 skip（如用户加了“考试”等词会被拦）。
         // 考试来源任务即使未识别出答题页，也绝不回退为 22 秒普通浏览。
+        // 非考试任务（搜索/普通浏览）不再做无谓的答题 OCR 检测，减少每轮等待（P1）。
         boolean sourceExam = isExamLikeTask(task.name);
-        QuizPageInfo quiz = detectQuizPageWithRetry(task, sourceExam ? 3 : 2);
-        if (quiz != null) {
-            logMode("分类：" + task.name + " -> QUIZ（黑名单未命中，method=" + quiz.method + "）");
-            handleQuizTask(quiz);
-            if (stopRequested) return;
-            returnToTaskList(currentMode);
-            if (!stopRequested) AppState.status = "识别任务中";
-            return;
-        }
         if (sourceExam) {
+            QuizPageInfo quiz = detectQuizPageWithRetry(task, 3);
+            if (quiz != null) {
+                logMode("分类：" + task.name + " -> QUIZ（黑名单未命中，method=" + quiz.method + "）");
+                handleQuizTask(quiz);
+                if (stopRequested) return;
+                returnToTaskList(currentMode);
+                if (!stopRequested) AppState.status = "识别任务中";
+                return;
+            }
             logMode("QUIZ_UNRECOGNISED source=" + task.name
                     + "（考试任务未识别出答题页，不执行 22 秒浏览，安全返回任务列表）");
             returnToTaskList(currentMode);
@@ -732,6 +754,8 @@ public class AutomationService extends Service {
         }
 
         if (searchTask) {
+            logMode("SEARCH_PROGRESS before=" + task.current + "/" + task.total
+                    + "（返回任务列表后由主循环复核 after）");
             SearchResult result = handleSearchTask();
             if (stopRequested) return;
             if (result == SearchResult.FAILED) {
@@ -813,15 +837,25 @@ public class AutomationService extends Service {
     /** 是否为“历史搜索/搜索发现”搜索中间页（双11搜索任务的必经中间页）。 */
     private boolean isSearchDiscoveryPage(OcrEngine.Snapshot snap) {
         if (snap == null) return false;
-        String all = normalizeOcr(snap.allText());
-        return all.contains("搜索发现") || all.contains("历史搜索");
+        return isSearchTitleText(snap.allText());
+    }
+
+    /** 文本是否为“搜索发现/历史搜索”标题行（含 OCR 把「索」误识为「素」等单字容错）。 */
+    private boolean isSearchTitleText(String text) {
+        if (text == null) return false;
+        String n = normalizeOcr(text);
+        return n.contains("搜索发现") || fuzzyContains(n, "搜索发现", 1)
+                || n.contains("历史搜索") || fuzzyContains(n, "历史搜索", 1);
     }
 
     private boolean isUnsafeSearchDiscoveryText(String t) {
         String[] unsafe = {"删除", "清空", "反馈", "客服", "购物车", "结算", "支付",
-                "收藏", "加购", "下单", "搜索发现", "历史搜索"};
+                "收藏", "加购", "下单"};
+        // 标题锚本身（含「搜素发现」）不能当作推荐卡点击。
+        if (isSearchTitleText(t)) return true;
+        String n = normalizeOcr(t);
         for (String w : unsafe) {
-            if (t.contains(w)) return true;
+            if (n.contains(w)) return true;
         }
         return false;
     }
@@ -835,17 +869,9 @@ public class AutomationService extends Service {
         if (snap == null) return null;
         int anchorBottom = -1;
         for (OcrEngine.OcrRow row : snap.rows) {
-            if (normalizeOcr(row.text).contains("搜索发现")) {
+            if (isSearchTitleText(row.text)) {
                 anchorBottom = row.bounds.bottom;
                 break;
-            }
-        }
-        if (anchorBottom < 0) {
-            for (OcrEngine.OcrRow row : snap.rows) {
-                if (normalizeOcr(row.text).contains("历史搜索")) {
-                    anchorBottom = row.bounds.bottom;
-                    break;
-                }
             }
         }
         if (anchorBottom < 0) return null;
@@ -943,16 +969,27 @@ public class AutomationService extends Service {
     }
 
     private SearchResult handleSearchTask() throws Exception {
-        AppState.status = "搜索任务：OCR定位搜索框";
+        AppState.status = "搜索任务：优先直接输入";
 
-        // 能量模式：优先处理“历史搜索/搜索发现”中间页（点推荐项 → 浏览 → 逐步返回）。
         if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            // 路径 A：搜索页已自动聚焦（键盘弹出）时，不依赖 OCR 定位推荐卡/搜索框，
+            //        直接 Shizuku input text 输入 + 回车提交，再验证进入结果/浏览页。
+            SearchResult direct = tryDirectImeSearch();
+            if (direct != null) return direct;
+            // 路径 B：OCR 定位能量页搜索栏（含「搜素发现」容错 + 顶部橙色搜索按钮），
+            //        点击输入栏聚焦后输入并提交。
+            SearchResult visual = tryEnergyVisualSearch();
+            if (visual != null) return visual;
+            // 路径 C：最后兜底——“历史搜索/搜索发现”推荐项法（点推荐项 → 浏览 → 逐步返回）。
             Boolean discovery = tryHandleSearchDiscoveryPage();
             if (discovery != null) {
                 return discovery ? SearchResult.HANDLED_AND_BROWSED : SearchResult.FAILED;
             }
+            logMode("搜索任务三条路径均未成功；直接返回任务列表，不在搜索入口页空滑");
+            return SearchResult.FAILED;
         }
 
+        // 金币模式：保持旧版 OCR 搜索栏输入（findSearchVisualTarget → 提交 → 外层 22 秒浏览）。
         for (int attempt = 1; attempt <= 8 && !stopRequested; attempt++) {
             try {
                 OcrEngine.Snapshot snap = ocr.captureSearchPage();
@@ -978,6 +1015,44 @@ public class AutomationService extends Service {
         return SearchResult.FAILED;
     }
 
+    /**
+     * 后备路径 B：能量页 OCR 定位搜索栏，点击输入框聚焦后输入并点击提交，浏览约 8 秒。
+     * 返回 null 表示若干轮内未定位到搜索栏或输入/提交两次失败，交由路径 C（推荐卡）兜底；
+     * 返回 SearchResult 表示已按本路径处理（成功浏览 / 失败安全返回，绝不空滑 22 秒）。
+     */
+    private SearchResult tryEnergyVisualSearch() throws Exception {
+        int submitAttempts = 0;
+        for (int attempt = 1; attempt <= 4 && !stopRequested; attempt++) {
+            OcrEngine.Snapshot snap;
+            try {
+                snap = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("能量搜索栏 OCR 失败 (" + attempt + "/4): " + e.getMessage());
+                sleep(650);
+                continue;
+            }
+            SearchVisualTarget target = findEnergySearchTarget(snap);
+            if (target == null) {
+                if (attempt >= 2) return null;   // 连续两轮未定位，回退路径 C
+                sleep(650);
+                continue;
+            }
+            logMode("SEARCH_INPUT path=ocr-visual（能量页搜索栏 y=" + target.inputY + "）");
+            if (submitSearchByVisualTarget(target)) {
+                logMode("SEARCH_BROWSE duration=8s start");
+                OcrEngine.Snapshot dim = ocr.captureSearchPage();
+                browseFor(dim.width, dim.height, 8_000L, false);
+                logMode("SEARCH_BROWSE duration=8s result="
+                        + (stopRequested ? "stopped" : "completed"));
+                return stopRequested ? SearchResult.FAILED : SearchResult.HANDLED_AND_BROWSED;
+            }
+            if (stopRequested) return SearchResult.FAILED;
+            if (++submitAttempts >= 2) return null;   // 输入/提交两次失败，回退路径 C
+            sleep(900);
+        }
+        return null;
+    }
+
     private boolean submitSearchByVisualTarget(SearchVisualTarget target) throws Exception {
         if (target == null || stopRequested) return false;
 
@@ -985,13 +1060,19 @@ public class AutomationService extends Service {
         sleep(650);
         if (stopRequested) return false;
 
-        String keyword = SEARCH_KEYS_ASCII.get(random.nextInt(SEARCH_KEYS_ASCII.size()));
+        SearchKeyword kw = nextSearchKeyword();
+        String keyword = sanitizeSearchAscii(kw.ascii);
+        if (keyword.isEmpty()) {
+            logMode("SEARCH_INPUT path=ocr-visual label=" + kw.display + " failed reason=EMPTY_QUERY");
+            return false;
+        }
+        logMode("SEARCH_INPUT path=ocr-visual label=" + kw.display + " query=" + keyword);
         // 先尝试清掉可能残留的旧关键词，再输入纯 ASCII，避免依赖任何 EditText/IME API。
         ShizukuShell.exec("input keyevent KEYCODE_MOVE_END");
         ShizukuShell.exec("i=0; while [ $i -lt 24 ]; do input keyevent KEYCODE_DEL; i=$((i+1)); done");
         ShizukuShell.Result typed = ShizukuShell.exec("input text " + keyword);
         if (!typed.ok()) {
-            logMode("Shizuku 向搜索框输入关键词失败: " + typed.output);
+            logMode("SEARCH_INPUT path=ocr-visual failed reason=SHELL_INPUT_FAILED " + typed.output);
             return false;
         }
         logMode("已用 Shizuku 向 OCR 定位的搜索框输入关键词: " + keyword);
@@ -1018,6 +1099,354 @@ public class AutomationService extends Service {
 
         sleep(1200);
         return !stopRequested;
+    }
+
+    /**
+     * 搜索词轮转选择：首次随机，之后顺序取下一个。避免一次 (0/5) 循环总选到同一个词；
+     * 不需要配置界面，词池为硬编码 allowlist，天然安全。
+     */
+    private SearchKeyword nextSearchKeyword() {
+        int n = SEARCH_KEYWORDS.length;
+        int idx;
+        if (lastSearchKeywordIndex < 0 || lastSearchKeywordIndex >= n) {
+            idx = random.nextInt(n);
+        } else {
+            idx = (lastSearchKeywordIndex + 1) % n;
+        }
+        lastSearchKeywordIndex = idx;
+        return SEARCH_KEYWORDS[idx];
+    }
+
+    /**
+     * 输入值安全处理：仅保留 ASCII 字母数字，其余字符一律丢弃，禁止把未知 OCR 字符串拼进
+     * Shell。词池本身已是纯 ASCII，此为防御性 allowlist。
+     */
+    private static String sanitizeSearchAscii(String value) {
+        if (value == null) return "";
+        StringBuilder sb = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 通过 dumpsys input_method 检测输入法是否可见（mInputShown / mIsInputViewShown）。
+     * 仅作为“搜索框已聚焦”的辅助证据，必须与搜索页特征结合，绝不单独据此输入。
+     */
+    private boolean isImeVisible() {
+        try {
+            ShizukuShell.Result r = ShizukuShell.exec(
+                    "dumpsys input_method | grep -E 'mInputShown|mIsInputViewShown'");
+            if (r == null) return false;
+            String out = r.output;
+            return out.contains("mInputShown=true") || out.contains("mIsInputViewShown=true");
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    /**
+     * 搜索页统一认证：收集标题（搜索发现/历史搜索，含「索→素」单字容错）、顶部搜索框、
+     * 右侧「搜索」按钮、推荐项等证据，供 direct-IME / OCR 搜索栏 / 推荐卡三条路径共用，
+     * 避免各路径各用一套关键词导致连锁失败。不因页面仅出现“搜索”二字就认定输入页。
+     */
+    private SearchPageEvidence classifySearchPage(OcrEngine.Snapshot snap) {
+        if (snap == null) return SearchPageEvidence.EMPTY;
+        String all = normalizeOcr(snap.allText());
+        boolean discovery = all.contains("搜索发现") || fuzzyContains(all, "搜索发现", 1);
+        boolean history = all.contains("历史搜索") || fuzzyContains(all, "历史搜索", 1);
+
+        int[] searchBarPoint = null;
+        int[] orangeSearchPoint = null;
+        boolean searchBar = false;
+        boolean orangeSearch = false;
+        String titleRaw = "";
+        float topBand = snap.height * 0.22f;
+
+        for (OcrEngine.OcrRow row : snap.rows) {
+            String t = normalizeOcr(row.text);
+            if (titleRaw.isEmpty() && isSearchTitleText(t)) titleRaw = t;
+            int cy = row.bounds.centerY();
+            if (cy >= topBand) continue;
+            int cx = row.bounds.centerX();
+            if (t.contains("搜索宝贝") || fuzzyContains(t, "搜索宝贝", 1)
+                    || (t.equals("搜索") && cx < snap.width * 0.8f)) {
+                searchBar = true;
+                if (searchBarPoint == null) searchBarPoint = new int[]{cx, cy};
+            }
+            if (t.equals("搜索") && cx >= snap.width * 0.75f) {
+                orangeSearch = true;
+                if (orangeSearchPoint == null) orangeSearchPoint = new int[]{cx, cy};
+            }
+        }
+        // 元素级补充顶部搜索框/搜索按钮（行级 OCR 会把两列或多元素合并成一行）。
+        if (snap.elements != null) {
+            for (OcrEngine.OcrRow e : snap.elements) {
+                String t = normalizeOcr(e.text);
+                int cy = e.bounds.centerY();
+                if (cy >= topBand) continue;
+                int cx = e.bounds.centerX();
+                if ((t.contains("搜索") && t.length() <= 6) && cx < snap.width * 0.8f) {
+                    searchBar = true;
+                    if (searchBarPoint == null) searchBarPoint = new int[]{cx, cy};
+                }
+                if (t.contains("搜索") && cx >= snap.width * 0.75f) {
+                    orangeSearch = true;
+                    if (orangeSearchPoint == null) orangeSearchPoint = new int[]{cx, cy};
+                }
+            }
+        }
+
+        // 推荐项：标题下方存在非危险商品文字（即使「历史搜索」已清空仍有「搜索发现」）。
+        boolean recommendations = false;
+        if (discovery || history) {
+            int anchorBottom = -1;
+            for (OcrEngine.OcrRow row : snap.rows) {
+                if (isSearchTitleText(row.text)) { anchorBottom = row.bounds.bottom; break; }
+            }
+            if (anchorBottom > 0) {
+                for (OcrEngine.OcrRow row : snap.rows) {
+                    if (row.bounds.centerY() <= anchorBottom + 8) continue;
+                    String t = normalizeOcr(row.text);
+                    if (t.length() >= 2 && !isUnsafeSearchDiscoveryText(t)) {
+                        recommendations = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return new SearchPageEvidence(discovery, history, searchBar, orangeSearch,
+                recommendations, searchBarPoint, orangeSearchPoint, titleRaw);
+    }
+
+    /** 搜索页统一认证证据（供 direct-IME / OCR 搜索栏 / 推荐卡三条路径共用）。 */
+    private static final class SearchPageEvidence {
+        static final SearchPageEvidence EMPTY =
+                new SearchPageEvidence(false, false, false, false, false, null, null, "");
+        final boolean discovery;      // 「搜索发现」标题（含「搜素发现」容错）
+        final boolean history;        // 「历史搜索」标题
+        final boolean searchBar;      // 顶部搜索输入框/占位
+        final boolean orangeSearch;   // 右侧「搜索」按钮
+        final boolean recommendations;// 标题下方存在推荐商品项
+        final int[] searchBarPoint;   // 搜索框中心（可能为 null）
+        final int[] orangeSearchPoint;// 搜索按钮中心（可能为 null）
+        final String titleRaw;        // 命中的标题原文（日志用）
+
+        SearchPageEvidence(boolean discovery, boolean history, boolean searchBar,
+                           boolean orangeSearch, boolean recommendations,
+                           int[] searchBarPoint, int[] orangeSearchPoint, String titleRaw) {
+            this.discovery = discovery;
+            this.history = history;
+            this.searchBar = searchBar;
+            this.orangeSearch = orangeSearch;
+            this.recommendations = recommendations;
+            this.searchBarPoint = searchBarPoint;
+            this.orangeSearchPoint = orangeSearchPoint;
+            this.titleRaw = titleRaw == null ? "" : titleRaw;
+        }
+
+        boolean isEntry() {
+            return discovery || history || searchBar || orangeSearch;
+        }
+    }
+
+    /**
+     * P0：能量搜索优先利用“已聚焦输入框直接输入”。仅当同时满足：
+     *   (a) 仍在淘宝前台；(b) OCR 确认为搜索入口页（搜索发现/历史搜索 或 新版搜索框）；
+     *   (c) 输入法可见（键盘已弹出，说明输入框已聚焦）
+     * 才执行不点击 OCR 坐标的 Shizuku `input text`，再回车提交并验证结果页；浏览约 8 秒。
+     * 返回 null 表示页面/焦点未确认，交由旧方法兜底；返回 SearchResult 表示本方法已按
+     * direct-ime 路径处理（成功浏览 / 失败安全返回，绝不空滑 22 秒）。
+     */
+    private SearchResult tryDirectImeSearch() throws Exception {
+        AppState.status = "搜索任务：确认输入框焦点";
+        for (int attempt = 1; attempt <= 3 && !stopRequested; attempt++) {
+            ForegroundState fg = currentForeground();
+            if (!fg.isPackage(TB)) {
+                logMode("SEARCH_PAGE page_not_confirmed reason=PAGE_NOT_CONFIRMED fg=" + fg);
+                return SearchResult.FAILED;
+            }
+
+            OcrEngine.Snapshot snap;
+            try {
+                snap = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("SEARCH_PAGE ocr_failed: " + e.getMessage());
+                sleep(700);
+                continue;
+            }
+
+            SearchPageEvidence ev = classifySearchPage(snap);
+            if (!ev.isEntry()) {
+                if (attempt >= 3) {
+                    logMode("SEARCH_PAGE page_not_confirmed reason=PAGE_NOT_CONFIRMED");
+                    return null;   // 非搜索页，回退旧方法（推荐卡/OCR 定位搜索框）
+                }
+                sleep(700);
+                continue;
+            }
+
+            boolean ime = isImeVisible();
+            String act = fg.activityName;
+            if (act != null && act.contains(".")) act = act.substring(act.lastIndexOf('.') + 1);
+            logMode("SEARCH_PAGE activity=" + act
+                    + " evidence=" + describeSearchEvidence(ev)
+                    + " ime=" + ime
+                    + (ime ? " focus=inferred_from_ime" : " focus=unconfirmed"));
+
+            if (!ime) {
+                logMode("SEARCH_INPUT path=direct-ime skipped reason=FOCUS_NOT_CONFIRMED");
+                return null;   // 焦点不确定，不盲目 input text；回退旧方法
+            }
+
+            SearchKeyword kw = nextSearchKeyword();
+            String query = sanitizeSearchAscii(kw.ascii);
+            if (query.isEmpty()) {
+                logMode("SEARCH_INPUT path=direct-ime label=" + kw.display + " failed reason=EMPTY_QUERY");
+                return SearchResult.FAILED;
+            }
+            logMode("SEARCH_INPUT path=direct-ime label=" + kw.display + " query=" + query);
+
+            // 输入前仅做有界清除：先移到行尾，再删除最多 12 个字符，避免焦点不明时盲目清除。
+            ShizukuShell.exec("input keyevent KEYCODE_MOVE_END");
+            ShizukuShell.exec("i=0; while [ $i -lt 12 ]; do input keyevent KEYCODE_DEL; i=$((i+1)); done");
+            ShizukuShell.Result typed = ShizukuShell.exec("input text " + query);
+            if (!typed.ok()) {
+                logMode("SEARCH_INPUT path=direct-ime failed reason=SHELL_INPUT_FAILED " + typed.output);
+                return SearchResult.FAILED;
+            }
+            sleep(400);
+            if (stopRequested) return SearchResult.FAILED;
+
+            // 提交：优先键盘回车（避免依赖 OCR 定位“搜索”按钮坐标）。
+            ShizukuShell.Result enter = ShizukuShell.exec("input keyevent KEYCODE_ENTER");
+            if (!enter.ok()) {
+                logMode("SEARCH_SUBMIT path=enter failed reason=SHELL_INPUT_FAILED " + enter.output);
+                return SearchResult.FAILED;
+            }
+            sleep(2200);
+            if (stopRequested) return SearchResult.FAILED;
+
+            // P0-C：正向确认已进入结果页（至少两个独立信号），绝不用“找不到入口页”当成功。
+            OcrEngine.Snapshot after = null;
+            try {
+                after = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("SEARCH_SUBMIT 验证 OCR 失败: " + e.getMessage());
+            }
+            boolean entered = confirmSearchResult(after, query);
+            if (!entered) {
+                sleep(1200);
+                try {
+                    after = ocr.captureSearchPage();
+                } catch (Throwable e) {
+                    logMode("SEARCH_SUBMIT 二次验证 OCR 失败: " + e.getMessage());
+                }
+                entered = confirmSearchResult(after, query);
+            }
+
+            if (!entered) {
+                logMode("SEARCH_SUBMIT path=enter confirmed=false reason=SUBMIT_NOT_CONFIRMED");
+                return SearchResult.FAILED;
+            }
+
+            logMode("SEARCH_SUBMIT path=enter confirmed=true page=results");
+            logMode("SEARCH_BROWSE duration=8s start");
+            OcrEngine.Snapshot dim = ocr.captureSearchPage();
+            browseFor(dim.width, dim.height, 8_000L, false);
+            logMode("SEARCH_BROWSE duration=8s result="
+                    + (stopRequested ? "stopped" : "completed"));
+            return stopRequested ? SearchResult.FAILED : SearchResult.HANDLED_AND_BROWSED;
+        }
+        return null;
+    }
+
+    /** 简短证据描述（日志用），例如 discovery_fuzzy(raw=搜素发现) / history / searchbar。 */
+    private String describeSearchEvidence(SearchPageEvidence ev) {
+        if (ev == null) return "none";
+        StringBuilder sb = new StringBuilder();
+        if (ev.discovery) {
+            sb.append("discovery");
+            if (!ev.titleRaw.isEmpty() && !ev.titleRaw.contains("搜索发现")) {
+                sb.append("_fuzzy(raw=").append(ev.titleRaw).append(")");
+            }
+        } else if (ev.history) {
+            sb.append("history");
+        } else if (ev.searchBar) {
+            sb.append("searchbar");
+        } else if (ev.orangeSearch) {
+            sb.append("orange_search");
+        } else {
+            sb.append("none");
+        }
+        if (ev.recommendations) sb.append("+recs");
+        return sb.toString();
+    }
+
+    /** 结果页正向标记：排序栏（综合/销量/筛选）、为你推荐/猜你喜欢 等。 */
+    private boolean hasResultPageMarkers(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        String all = normalizeOcr(snap.allText());
+        return all.contains("综合") || all.contains("销量") || all.contains("筛选")
+                || all.contains("为你推荐") || all.contains("猜你喜欢");
+    }
+
+    /**
+     * P0-C：正向确认已进入搜索结果页，要求至少两个相互独立的信号：
+     *   1) 离开搜索入口页（发现/历史标题、顶部搜索框均消失）；
+     *   2) 输入法收起；
+     *   3) 出现结果页标记（综合/销量/筛选/为你推荐/猜你喜欢）；
+     *   4) 查询词出现在结果页。
+     * 绝不把“OCR 漏识别搜索页”误报为搜索成功。
+     */
+    private boolean confirmSearchResult(OcrEngine.Snapshot snap, String query) {
+        if (snap == null) return false;
+        SearchPageEvidence ev = classifySearchPage(snap);
+        String all = normalizeOcr(snap.allText());
+        int signals = 0;
+        StringBuilder evidence = new StringBuilder();
+        if (!ev.isEntry()) { signals++; evidence.append("left_entry"); }
+        if (!isImeVisible()) { signals++; evidence.append("+keyboard_hidden"); }
+        if (hasResultPageMarkers(snap)) { signals++; evidence.append("+result_grid"); }
+        if (!query.isEmpty() && all.toLowerCase().contains(query.toLowerCase())) {
+            signals++; evidence.append("+query_present");
+        }
+        logMode("SEARCH_SUBMIT verify signals=" + signals + " evidence=" + evidence
+                + " entry=" + ev.isEntry());
+        return signals >= 2;
+    }
+
+    /**
+     * 能量搜索页的 OCR 搜索栏定位（后备路径 B）。优先用 classifySearchPage 得到的
+     * 搜索框/搜索按钮坐标，缺失时用顶部带比例兜底（不照搬金币页 y=436 固定值）。
+     * 仅当页面被认证为搜索入口页时才返回非 null。
+     */
+    private SearchVisualTarget findEnergySearchTarget(OcrEngine.Snapshot snap) {
+        if (snap == null) return null;
+        SearchPageEvidence ev = classifySearchPage(snap);
+        if (!ev.isEntry()) return null;
+
+        int inputX, inputY, searchX, searchY;
+        if (ev.searchBarPoint != null) {
+            inputX = ev.searchBarPoint[0];
+            inputY = ev.searchBarPoint[1];
+        } else {
+            inputX = (int) (snap.width * 0.36f);
+            inputY = (int) (snap.height * 0.11f);
+        }
+        if (ev.orangeSearchPoint != null) {
+            searchX = ev.orangeSearchPoint[0];
+            searchY = ev.orangeSearchPoint[1];
+        } else {
+            searchX = (int) (snap.width * 0.90f);
+            searchY = inputY;
+        }
+        return new SearchVisualTarget(inputX, inputY, searchX, searchY);
     }
 
     private SearchVisualTarget findSearchVisualTarget(OcrEngine.Snapshot snap) {

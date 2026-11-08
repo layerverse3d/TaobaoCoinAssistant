@@ -1,4 +1,4 @@
-name: Publish v1.2.0-d11 source release
+name: Publish v1.2.1-d11 source release
 
 on:
   workflow_dispatch:
@@ -21,23 +21,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.2.0-d11"
+          TAG="v1.2.1-d11"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists; leaving it unchanged."
             exit 0
           fi
           cat > /tmp/release-notes.md <<'NOTES'
-          ## 淘金币助手 · 2026 双11扩展版（个人 Fork）
+          ## 淘金币助手 · v1.2.1-d11（双11搜索稳定性更新）
 
-          基于 [Doplars/TaobaoCoinAssistant](https://github.com/Doplars/TaobaoCoinAssistant) 修改；**非原作者官方版本**。
+          个人维护的 [Doplars/TaobaoCoinAssistant](https://github.com/Doplars/TaobaoCoinAssistant) Fork，**不是原作者官方版本**。在 [v1.2.0-d11](https://github.com/layerverse3d/TaobaoCoinAssistant/releases/tag/v1.2.0-d11) 基础上更新：
 
-          - ⚡ 自动进入双十一赛车活动「赚能量」任务面板，支持常规浏览、搜索发现推荐项、部分答题与累计奖励的识别处理。
-          - 🪙 适配双十一活动左侧「去赚金币」入口，兼容原有金币自动任务流程。
-          - 共享黑名单与规则迁移，OCR 安全判断、悬浮窗原地重启、日志跟随/复制/清空。
-          - 2026-10-22 在 **小米 13 Ultra** 上验证：能量主要任务、金币任务入口与大部分旧功能可用。金币个别任务仍可能不兼容。
+          - ⚡ **双11能量搜索任务**：优先对已聚焦的搜索栏使用 Shizuku 输入英文关键词，再提交搜索、浏览并返回任务列表。
+          - 🔎 **OCR 容错**：兼容「搜索发现」被识别成「搜素发现」，综合页面特征、搜索 Activity 和输入法辅助确认，减少偶发搜索入口识别失败。
+          - 🔁 **有界回退**：直接输入不可用时，尝试 OCR 定位搜索栏或安全推荐项；避免空滑、误点及无限重复。
+          - ✅ **搜索结果验证**：增加正向页面证据和日志，在确认搜索结果后才开始浏览。
+          - 🔤 **关键词池**：iPhone、iPad、MacBook、Xiaomi、coffeeBeans、router、keyboard、SSD、PETG 等，ASCII 输入保留大小写。
+          - 📱 **真机验收**：2026-11-08，小米 13 Ultra；双十一「搜一搜你喜欢的宝贝」从 3/5 继续完成余下次数。金币模式维持原有能力和限制。
 
-          **发布范围：**仅提供本次 GitHub 源码快照，不附加 APK。当前 CI 产生临时签名 Debug APK，不具备长期稳定更新签名；上游仓库也未见明确 LICENSE，修改和再分发仍需尊重原作者权利。
-
-          安装、局限与项目来源详见 README。请勿将此 Fork 视为淘宝或原作者的官方客户端。
+          **发布范围：**仅源码快照，不附加 APK。当前 CI 产物为临时签名 Debug APK，可能无法直接覆盖其他构建版本；上游未见明确 LICENSE，因此不将本 Fork 声称为可自由再分发的官方发行版。详见 README。
           NOTES
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "v1.2.0-d11 · 双11能量扩展版（源码）" --notes-file /tmp/release-notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "v1.2.1-d11 · 双11搜索稳定性更新（源码）" --notes-file /tmp/release-notes.md

@@ -3,7 +3,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [ "main", "master", "feature/double11-energy" ]
+    branches: [ "main", "master", "feature/double11-energy", "fix/energy-search-direct-input" ]
 
 jobs:
   build:
