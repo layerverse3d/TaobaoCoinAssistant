@@ -17,7 +17,6 @@ import android.os.Looper;
 import android.os.SystemClock;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -74,11 +73,32 @@ public class AutomationService extends Service {
     // 本轮已对“看…得能量”促销覆盖层执行的动作次数（BACK/安全X），上限 3 次，防止连续乱按。
     private int promoOverlayActions = 0;
 
-    // 当新版 UC WebView 不暴露 EditText 时，Android shell 的 `input text` 对中文并不可靠。
-    // 因此 OCR+Shizuku 兜底使用纯 ASCII 搜索词；只用于完成“搜一搜”任务，不改变任务筛选规则。
-    private static final List<String> SEARCH_KEYS_ASCII = Arrays.asList(
-            "iphone", "macbook", "xiaomi", "camera", "milk"
-    );
+    // 搜索词轮转索引：避免一次 0/5 循环总选到同一个词；每轮执行前重置。
+    private int lastSearchKeywordIndex = -1;
+
+    // 搜索词池：显示名（中文/品牌，用于日志）映射到安全 ASCII 实际输入值。
+    // Android shell 的 `input text` 对中文/空格/特殊字符不可靠，因此实际输入只允许纯 ASCII 字母数字；
+    // 大小写按表格保留，若淘宝/输入法将其规范化为小写不视为失败，以搜索结果与进度确认为准。
+    // 仅用于完成“搜一搜”任务，绝不加入任务黑名单或分类规则。
+    private static final class SearchKeyword {
+        final String display;
+        final String ascii;
+        SearchKeyword(String display, String ascii) { this.display = display; this.ascii = ascii; }
+    }
+
+    private static final SearchKeyword[] SEARCH_KEYWORDS = new SearchKeyword[]{
+            new SearchKeyword("iPhone", "iPhone"),
+            new SearchKeyword("iPad", "iPad"),
+            new SearchKeyword("MacBook", "MacBook"),
+            new SearchKeyword("小米", "Xiaomi"),
+            new SearchKeyword("咖啡豆", "coffeeBeans"),
+            new SearchKeyword("相机", "camera"),
+            new SearchKeyword("路由器", "router"),
+            new SearchKeyword("键盘", "keyboard"),
+            new SearchKeyword("固态硬盘", "SSD"),
+            new SearchKeyword("3D打印耗材", "PETG"),
+            new SearchKeyword("牛奶", "milk")
+    };
 
     // “看…得能量”促销覆盖层标题锚（看抵扣快闪得能量 / 看宠物好货得能量 等变体）。
     private static final Pattern PROMO_OVERLAY_TITLE = Pattern.compile("看.{1,10}得能量");
@@ -267,6 +287,7 @@ public class AutomationService extends Service {
         saveLastMode(currentMode);
         energyPanelConfirmed = false;
         promoOverlayActions = 0;
+        lastSearchKeywordIndex = -1;
         automationJobActive = true;
         stopRequested = false;
         attempted.clear();
@@ -699,11 +720,11 @@ public class AutomationService extends Service {
         // 能量模式受限搜索候选：OCR 截断的“你喜欢的宝贝(0/5)”仍应按搜索流程执行。
         boolean energySearchCandidate = currentMode == TaskMode.DOUBLE11_ENERGY
                 && TaskParser.isEnergySearchCandidate(task);
-        if (energySearchCandidate && !searchTask) {
-            logMode("SEARCH_CLASSIFY raw=" + task.name
-                    + " reason=energy_title_variant confidence=candidate");
-        }
         searchTask = searchTask || energySearchCandidate;
+        if (searchTask) {
+            logMode("SEARCH_CLASSIFY task=" + task.name + " mode=search"
+                    + (energySearchCandidate ? " reason=energy_title_variant" : ""));
+        }
         logMode("准备执行任务[" + TaskParser.displayMode(task, taskRules) + "]: " + task.name);
 
         int x = (int) (width * 0.875f);
@@ -732,6 +753,8 @@ public class AutomationService extends Service {
         }
 
         if (searchTask) {
+            logMode("SEARCH_PROGRESS before=" + task.current + "/" + task.total
+                    + "（返回任务列表后由主循环复核 after）");
             SearchResult result = handleSearchTask();
             if (stopRequested) return;
             if (result == SearchResult.FAILED) {
@@ -943,14 +966,19 @@ public class AutomationService extends Service {
     }
 
     private SearchResult handleSearchTask() throws Exception {
-        AppState.status = "搜索任务：OCR定位搜索框";
+        AppState.status = "搜索任务：优先直接输入";
 
-        // 能量模式：优先处理“历史搜索/搜索发现”中间页（点推荐项 → 浏览 → 逐步返回）。
         if (currentMode == TaskMode.DOUBLE11_ENERGY) {
+            // 1) 优先：搜索页已自动聚焦（键盘弹出）时，不依赖 OCR 定位推荐卡/搜索框，
+            //    直接 Shizuku input text 输入 + 回车提交，再验证进入结果/浏览页。
+            SearchResult direct = tryDirectImeSearch();
+            if (direct != null) return direct;
+            // 2) 回退：旧“历史搜索/搜索发现”推荐项法（点推荐项 → 浏览 → 逐步返回）。
             Boolean discovery = tryHandleSearchDiscoveryPage();
             if (discovery != null) {
                 return discovery ? SearchResult.HANDLED_AND_BROWSED : SearchResult.FAILED;
             }
+            // 3) 回退：旧 OCR 定位搜索框输入/提交（金币/能量共用，往下走）。
         }
 
         for (int attempt = 1; attempt <= 8 && !stopRequested; attempt++) {
@@ -985,13 +1013,19 @@ public class AutomationService extends Service {
         sleep(650);
         if (stopRequested) return false;
 
-        String keyword = SEARCH_KEYS_ASCII.get(random.nextInt(SEARCH_KEYS_ASCII.size()));
+        SearchKeyword kw = nextSearchKeyword();
+        String keyword = sanitizeSearchAscii(kw.ascii);
+        if (keyword.isEmpty()) {
+            logMode("SEARCH_INPUT path=ocr-visual label=" + kw.display + " failed reason=EMPTY_QUERY");
+            return false;
+        }
+        logMode("SEARCH_INPUT path=ocr-visual label=" + kw.display + " query=" + keyword);
         // 先尝试清掉可能残留的旧关键词，再输入纯 ASCII，避免依赖任何 EditText/IME API。
         ShizukuShell.exec("input keyevent KEYCODE_MOVE_END");
         ShizukuShell.exec("i=0; while [ $i -lt 24 ]; do input keyevent KEYCODE_DEL; i=$((i+1)); done");
         ShizukuShell.Result typed = ShizukuShell.exec("input text " + keyword);
         if (!typed.ok()) {
-            logMode("Shizuku 向搜索框输入关键词失败: " + typed.output);
+            logMode("SEARCH_INPUT path=ocr-visual failed reason=SHELL_INPUT_FAILED " + typed.output);
             return false;
         }
         logMode("已用 Shizuku 向 OCR 定位的搜索框输入关键词: " + keyword);
@@ -1018,6 +1052,172 @@ public class AutomationService extends Service {
 
         sleep(1200);
         return !stopRequested;
+    }
+
+    /**
+     * 搜索词轮转选择：首次随机，之后顺序取下一个。避免一次 (0/5) 循环总选到同一个词；
+     * 不需要配置界面，词池为硬编码 allowlist，天然安全。
+     */
+    private SearchKeyword nextSearchKeyword() {
+        int n = SEARCH_KEYWORDS.length;
+        int idx;
+        if (lastSearchKeywordIndex < 0 || lastSearchKeywordIndex >= n) {
+            idx = random.nextInt(n);
+        } else {
+            idx = (lastSearchKeywordIndex + 1) % n;
+        }
+        lastSearchKeywordIndex = idx;
+        return SEARCH_KEYWORDS[idx];
+    }
+
+    /**
+     * 输入值安全处理：仅保留 ASCII 字母数字，其余字符一律丢弃，禁止把未知 OCR 字符串拼进
+     * Shell。词池本身已是纯 ASCII，此为防御性 allowlist。
+     */
+    private static String sanitizeSearchAscii(String value) {
+        if (value == null) return "";
+        StringBuilder sb = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 通过 dumpsys input_method 检测输入法是否可见（mInputShown / mIsInputViewShown）。
+     * 仅作为“搜索框已聚焦”的辅助证据，必须与搜索页特征结合，绝不单独据此输入。
+     */
+    private boolean isImeVisible() {
+        try {
+            ShizukuShell.Result r = ShizukuShell.exec(
+                    "dumpsys input_method | grep -E 'mInputShown|mIsInputViewShown'");
+            if (r == null) return false;
+            String out = r.output;
+            return out.contains("mInputShown=true") || out.contains("mIsInputViewShown=true");
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    /**
+     * 是否为能量搜索任务的合法搜索入口页：历史搜索/搜索发现中间页，或新版搜索框页。
+     * 用于 direct-ime 的“页面已确认”前提。
+     */
+    private boolean isEnergySearchPage(OcrEngine.Snapshot snap) {
+        if (snap == null) return false;
+        if (isSearchDiscoveryPage(snap)) return true;
+        return findSearchVisualTarget(snap) != null;
+    }
+
+    /**
+     * P0：能量搜索优先利用“已聚焦输入框直接输入”。仅当同时满足：
+     *   (a) 仍在淘宝前台；(b) OCR 确认为搜索入口页（搜索发现/历史搜索 或 新版搜索框）；
+     *   (c) 输入法可见（键盘已弹出，说明输入框已聚焦）
+     * 才执行不点击 OCR 坐标的 Shizuku `input text`，再回车提交并验证结果页；浏览约 8 秒。
+     * 返回 null 表示页面/焦点未确认，交由旧方法兜底；返回 SearchResult 表示本方法已按
+     * direct-ime 路径处理（成功浏览 / 失败安全返回，绝不空滑 22 秒）。
+     */
+    private SearchResult tryDirectImeSearch() throws Exception {
+        AppState.status = "搜索任务：确认输入框焦点";
+        for (int attempt = 1; attempt <= 3 && !stopRequested; attempt++) {
+            ForegroundState fg = currentForeground();
+            if (!fg.isPackage(TB)) {
+                logMode("SEARCH_PAGE page_not_confirmed reason=PAGE_NOT_CONFIRMED fg=" + fg);
+                return SearchResult.FAILED;
+            }
+
+            OcrEngine.Snapshot snap;
+            try {
+                snap = ocr.captureSearchPage();
+            } catch (Throwable e) {
+                logMode("SEARCH_PAGE ocr_failed: " + e.getMessage());
+                sleep(700);
+                continue;
+            }
+
+            if (!isEnergySearchPage(snap)) {
+                if (attempt >= 3) {
+                    logMode("SEARCH_PAGE page_not_confirmed reason=PAGE_NOT_CONFIRMED");
+                    return null;   // 非搜索页，回退旧方法（推荐卡/OCR 定位搜索框）
+                }
+                sleep(700);
+                continue;
+            }
+
+            boolean discovery = isSearchDiscoveryPage(snap);
+            boolean ime = isImeVisible();
+            logMode("SEARCH_PAGE confirmed discovery=" + discovery
+                    + " imeVisible=" + ime
+                    + (ime ? " focused=confirmed" : " focused=unconfirmed"));
+
+            if (!ime) {
+                logMode("SEARCH_INPUT path=direct-ime skipped reason=FOCUS_NOT_CONFIRMED");
+                return null;   // 焦点不确定，不盲目 input text；回退旧方法
+            }
+
+            SearchKeyword kw = nextSearchKeyword();
+            String query = sanitizeSearchAscii(kw.ascii);
+            if (query.isEmpty()) {
+                logMode("SEARCH_INPUT path=direct-ime label=" + kw.display + " failed reason=EMPTY_QUERY");
+                return SearchResult.FAILED;
+            }
+            logMode("SEARCH_INPUT path=direct-ime label=" + kw.display + " query=" + query);
+
+            // 输入前仅做有界清除：先移到行尾，再删除最多 12 个字符，避免焦点不明时盲目清除。
+            ShizukuShell.exec("input keyevent KEYCODE_MOVE_END");
+            ShizukuShell.exec("i=0; while [ $i -lt 12 ]; do input keyevent KEYCODE_DEL; i=$((i+1)); done");
+            ShizukuShell.Result typed = ShizukuShell.exec("input text " + query);
+            if (!typed.ok()) {
+                logMode("SEARCH_INPUT path=direct-ime failed reason=SHELL_INPUT_FAILED " + typed.output);
+                return SearchResult.FAILED;
+            }
+            sleep(400);
+            if (stopRequested) return SearchResult.FAILED;
+
+            // 提交：优先键盘回车（避免依赖 OCR 定位“搜索”按钮坐标）。
+            ShizukuShell.Result enter = ShizukuShell.exec("input keyevent KEYCODE_ENTER");
+            if (!enter.ok()) {
+                logMode("SEARCH_SUBMIT path=enter failed reason=SHELL_INPUT_FAILED " + enter.output);
+                return SearchResult.FAILED;
+            }
+            sleep(2200);
+            if (stopRequested) return SearchResult.FAILED;
+
+            // 验证已从搜索入口页转到结果/浏览页：搜索发现/搜索框占位特征应消失。
+            boolean entered = false;
+            try {
+                OcrEngine.Snapshot after = ocr.captureSearchPage();
+                entered = !isEnergySearchPage(after);
+            } catch (Throwable e) {
+                logMode("SEARCH_SUBMIT 验证 OCR 失败: " + e.getMessage());
+            }
+            if (!entered) {
+                sleep(1200);
+                try {
+                    OcrEngine.Snapshot after2 = ocr.captureSearchPage();
+                    entered = !isEnergySearchPage(after2);
+                } catch (Throwable e) {
+                    logMode("SEARCH_SUBMIT 二次验证 OCR 失败: " + e.getMessage());
+                }
+            }
+
+            if (!entered) {
+                logMode("SEARCH_SUBMIT path=enter confirmed=false reason=RESULT_NOT_ENTERED");
+                return SearchResult.FAILED;
+            }
+
+            logMode("SEARCH_SUBMIT path=enter confirmed=true page=results");
+            logMode("SEARCH_BROWSE duration=8s start");
+            OcrEngine.Snapshot dim = ocr.captureSearchPage();
+            browseFor(dim.width, dim.height, 8_000L, false);
+            logMode("SEARCH_BROWSE duration=8s result="
+                    + (stopRequested ? "stopped" : "completed"));
+            return stopRequested ? SearchResult.FAILED : SearchResult.HANDLED_AND_BROWSED;
+        }
+        return null;
     }
 
     private SearchVisualTarget findSearchVisualTarget(OcrEngine.Snapshot snap) {
